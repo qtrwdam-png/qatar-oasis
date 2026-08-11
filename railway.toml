@@ -1,5 +1,9 @@
 # Railway deployment configuration
 # https://railway.com/docs/config
+#
+# IMPORTANT: Do NOT set "Root Directory" to "backend" in Railway settings.
+# The server serves frontend from ../frontend (relative to backend),
+# so the whole repository must be the build context.
 
 [build]
 builder = "nixpacks"
