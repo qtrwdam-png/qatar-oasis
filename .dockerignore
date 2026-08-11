@@ -1,6 +1,9 @@
 node_modules
+**/node_modules
 .env
-.env.local
+.env.*
+**/.env
+**/.env.*
 .git
 .gitignore
 *.log
@@ -14,3 +17,4 @@ build
 *.swp
 *.swo
 مياه الواحة.zip
+backend/.env

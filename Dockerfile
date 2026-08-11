@@ -4,11 +4,15 @@ FROM node:20-slim
 
 WORKDIR /app
 
-# Copy entire repo (backend needs ../frontend at runtime)
-COPY . .
+# Copy package.json FIRST (separate layer = cached npm install)
+COPY backend/package.json backend/package-lock.json ./backend/
 
-# Install backend dependencies
+# Install backend dependencies (cached unless package.json changes)
 RUN cd backend && npm install
+
+# Copy entire repo (backend needs ../frontend at runtime)
+# This layer always reflects latest code changes
+COPY . .
 
 EXPOSE 3000
 
