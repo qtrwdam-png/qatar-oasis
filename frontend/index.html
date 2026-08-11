@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, shrink-to-fit=no">
+<!-- الميتا الأساسية لمحركات البحث -->
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>مياه واحة قطر | عروض مميزة وتوصيل سريع</title>
+<meta name="description" content="اطلب مياه واحة قطر الآن واستفد من أفضل العروض والأسعار. توصيل سريع وموثوق إلى باب منزلك.">
+<meta name="keywords" content="مياه واحة قطر, مياه شرب, توصيل مياه, عروض مياه قطر, مياه معدنية">
+
+<!-- الميتا الخاصة بـ Facebook و WhatsApp و LinkedIn -->
+<meta property="og:title" content="مياه واحة قطر | عروض مميزة وتوصيل سريع">
+<meta property="og:description" content="اطلب مياه واحة قطر الآن واستفد من أفضل العروض والأسعار.">
+<meta property="og:image" content="https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcR0CyWloTpiDJQahT8_Y_plnM4ip2UILO4n3Q&s">
+<meta property="og:url" content="رابط_موقعك_هنا">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="مياه واحة قطر">
+
+<!-- الميتا الخاصة بـ Twitter (X) -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="مياه واحة قطر | عروض مميزة وتوصيل سريع">
+<meta name="twitter:description" content="اطلب مياه واحة قطر الآن واستفد من أفضل العروض والأسعار.">
+<meta name="twitter:image" content="https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcR0CyWloTpiDJQahT8_Y_plnM4ip2UILO4n3Q&s">  <link rel="stylesheet" href="css/style.css">
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <style>
+    /* 1. تثبيت أبعاد الكارد لضمان تساويها */
+.product-card {
+    display: flex;
+    flex-direction: column;
+    height: 100%; /* لضمان تساوي ارتفاع الكروت */
+    overflow: hidden;
+}
+
+/* 2. حاوية الصورة (هذا أهم جزء) */
+.product-image-container {
+    width: 100%;
+    height: 250px; /* يمكنك تعديل الارتفاع حسب رغبتك */
+    background-color: #f8f9fa; /* لون خلفية للفراغات إذا كانت الصورة صغيرة */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+}
+
+/* 3. تنسيق الصورة داخل الحاوية */
+.product-image {
+    width: 100%;
+    height: 100%;
+    object-fit: contain; /* هذا هو الأمر الذي يمنع القص ويظهر الصورة كاملة */
+    padding: 10px; /* مساحة بسيطة حول الصورة */
+    transition: transform 0.3s ease;
+}
+    </style>
+</head>
+<body>
+  <!-- Header -->
+  <header class="header">
+    <div class="container header-content">
+      <div class="logo">
+        <div class="logo-icon">💧</div>
+        <div class="logo-text">
+          <h1>مياه واحة قطر</h1>
+          <span>qatar Oasis Water</span>
+        </div>
+      </div>
+
+    </div>
+  </header>
+
+
+
+  <!-- Hero Section -->
+  <section class="hero">
+    <div class="container hero-content">
+      <div class="hero-badge">
+        <span>✨</span>
+        <span>منتجات طبيعية 100% من قطرنا </span>
+      </div>
+      <h2>مياه نقية من قلب الطبيعة القطريه</h2>
+      <p>استمتع بأفضل أنواع المياه المعدنية والطبيعية من ينابيع قطر العريقة</p>
+    </div>
+  </section>
+
+  <!-- Products Section -->
+  <section class="products-section">
+    <div class="container">
+      <h2 class="section-title">العروض  </h2>
+      <div class="products-grid" id="productsContainer">
+        <div class="loading">
+          <div class="spinner"></div>
+          <p>جاري تحميل المنتجات...</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="container">
+      <p>© 2024 مياه واحة قطر - جميع الحقوق محفوظة 💧</p>
+    </div>
+  </footer>
+
+  <script src="js/main.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', async () => {
+      const productsContainer = document.getElementById('productsContainer');
+      
+      // Track page
+      trackPageChange('home');
+      
+      // Load products
+      const products = await fetchProducts();
+      
+      if (products.length === 0) {
+        productsContainer.innerHTML = `
+          <div style="text-align:center;padding:40px;color:var(--text-secondary);">
+            <p style="font-size:18px;">لا توجد منتجات متاحة يرجى اعادة تحميل الصفحة</p>
+          </div>
+        `;
+        return;
+      }
+      
+      productsContainer.innerHTML = products.map(product => `
+        <div class="product-card page">
+          <img src="${product.image_url || 'https://images.unsplash.com/photo-1548839140-29a749e1cf4d?w=400'}" 
+               alt="${product.name_ar}" 
+               class="product-image"
+               onerror="this.src='https://images.unsplash.com/photo-1548839140-29a749e1cf4d?w=400'">
+          <div class="product-info">
+            <h3 class="product-name">${product.name_ar}</h3>
+            <p class="product-description">${product.description || ''}</p>
+            <div class="product-footer">
+              <span class="product-price">${product.price} ر.ق</span>
+              <button class="btn btn-primary" onclick="viewProduct(${product.id})">
+                شراء الان 
+              </button>
+            </div>
+          </div>
+        </div>
+      `).join('');
+    });
+    
+    function viewProduct(productId) {
+      localStorage.setItem('selected_product', productId);
+      window.location.href = `pages/product.html?id=${productId}`;
+    }
+  </script>
+</body>
+</html>

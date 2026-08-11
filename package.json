@@ -1,0 +1,13 @@
+{
+  "name": "wateroman",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Water Oman full-stack app for Railway deployment",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "npm --prefix backend install",
+    "start": "npm --prefix backend start"
+  }
+}

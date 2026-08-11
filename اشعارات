@@ -1,0 +1,58 @@
+🔑 جميع المفاتيح والإعدادات المطلوبة لنظام الإشعارات
+1️⃣ Firebase Client SDK Configuration (لـ Frontend)
+الملف: frontend/admin/admin.js و firebase-messaging-sw.js
+firebase.initializeApp({
+  apiKey: "AIzaSyA9sRFkHrqOlRkyMfzl4AyK618J12D_uk8",
+  authDomain: "adminqatar-d4192.firebaseapp.com",
+  projectId: "adminqatar-d4192",
+  storageBucket: "adminqatar-d4192.firebasestorage.app",
+  messagingSenderId: "927564639029",
+  appId: "1:927564639029:web:025a0c2e77ce6bba367a7c"
+});
+VAPID Public Key (للاشتراك Push)
+applicationServerKey: urlBase64ToUint8Array("BC1WzxOMotqy7j1IV0w74SFfrxc5zeaODQ4XR87VT51ymhCluW9noLAD9-PxX4yWDMsDidJMkR6cojSIWdTBK1w")
+2️⃣ Firebase Admin SDK (لـ Backend)
+الملف: backend/firebase-admin.js
+const serviceAccount = {
+  "projectId": "adminqatar-d4192",
+  "privateKey": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----",
+  "clientEmail": "firebase-adminsdk-xxxxx@adminqatar-d4192.iam.gserviceaccount.com"
+};
+
+const VAPID_KEYS = {
+  publicKey: 'BC1WzxOMotqy7j1IV0w74SFfrxc5zeaODQ4XR87VT51ymhCluW9noLAD9-PxX4yWDMsDidJMkR6cojSIWdTBK1w',
+  privateKey: '...' // Private VAPID key
+};
+Environment Variables المطلوبة في .env:
+FIREBASE_PROJECT_ID=adminqatar-d4192
+FIREBASE_CLIENT_EMAIL=firebase-adminsdk-xxxxx@adminqatar-d4192.iam.gserviceaccount.com
+FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nMIIEvQ...\n-----END PRIVATE KEY-----"
+VAPID_PUBLIC_KEY=BC1WzxOMotqy7j1IV0w74SFfrxc5zeaODQ4XR87VT51ymhCluW9noLAD9-PxX4yWDMsDidJMkR6cojSIWdTBK1w
+VAPID_PRIVATE_KEY=...
+3️⃣ الملفات المطلوبة للنسخ
+الملف	الوصف	الموقع
+backend/firebase-admin.js	Firebase Admin SDK + إرسال الإشعارات	Backend
+frontend/admin/firebase-messaging-sw.js	Service Worker للإشعارات الخلفية	Frontend/admin
+frontend/admin/admin.js	تسجيل الـ FCM Token + أصوات الإشعارات	Frontend/admin
+4️⃣ التبعيات (package.json)
+{
+  "dependencies": {
+    "firebase-admin": "^14.0.0",
+    "web-push": "^3.6.7"
+  }
+}
+5️⃣ جدول قاعدة البيانات المطلوب
+CREATE TABLE IF NOT EXISTS admin_fcm_tokens (
+  id SERIAL PRIMARY KEY,
+  token TEXT NOT NULL UNIQUE,
+  enabled BOOLEAN DEFAULT true,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+6️⃣ API Endpoint المطلوب
+// حفظ FCM Token
+POST /api/admin/fcm-token
+Body: { "token": "...", "enabled": true }
+
+// حالة الإشعارات
+GET /api/admin/fcm-status
