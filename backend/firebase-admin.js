@@ -29,12 +29,12 @@ if (privateKey) {
 }
 
 if (!privateKey) {
-    throw new Error("FIREBASE_PRIVATE_KEY is missing or undefined in environment variables");
+    console.error("⚠️ WARNING: FIREBASE_PRIVATE_KEY is missing or undefined. Firebase notifications will not work. Server will continue without push notifications.");
 }
 
 const serviceAccount = {
   "projectId": process.env.FIREBASE_PROJECT_ID || "adminqatar-d4192",
-  "privateKey": privateKey,
+  "privateKey": privateKey || '',
   "clientEmail": process.env.FIREBASE_CLIENT_EMAIL
 };
 
